@@ -174,41 +174,48 @@ class ImageCanvas(QGraphicsView):
             del self.points_items[item_number]
         return    
     
+
     def array_to_qimage(self, arr, colormap):
         """Convert numpy array to QImage with colormap"""
         # Normalize to 0-255
         arr_norm = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-10) * 255).astype(np.uint8)
         h, w = arr_norm.shape
-        
+
+        # Create alpha mask: transparent where original value == 0
+        alpha = np.where(arr == 0, 0, 255).astype(np.uint8)
+
         if colormap == 'gray':
-            img = QImage(arr_norm.data, w, h, w, QImage.Format.Format_Grayscale8)
+            rgba = np.stack([arr_norm, arr_norm, arr_norm, alpha], axis=-1)
         elif colormap == 'green':
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            rgb[:, :, 1] = arr_norm
-            img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            rgba = np.stack([np.zeros_like(arr_norm),
+                            arr_norm,
+                            np.zeros_like(arr_norm),
+                            alpha], axis=-1)
         elif colormap == 'red':
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            rgb[:, :, 0] = arr_norm
-            img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            rgba = np.stack([arr_norm,
+                            np.zeros_like(arr_norm),
+                            np.zeros_like(arr_norm),
+                            alpha], axis=-1)
         elif colormap == 'blue':
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            rgb[:, :, 2] = arr_norm
-            img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            rgba = np.stack([np.zeros_like(arr_norm),
+                            np.zeros_like(arr_norm),
+                            arr_norm,
+                            alpha], axis=-1)
         elif colormap == 'cyan':
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            rgb[:, :, 1] = arr_norm
-            rgb[:, :, 2] = arr_norm
-            img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            rgba = np.stack([np.zeros_like(arr_norm),
+                            arr_norm,
+                            arr_norm,
+                            alpha], axis=-1)
         elif colormap == 'magenta':
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            rgb[:, :, 0] = arr_norm
-            rgb[:, :, 2] = arr_norm
-            img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            rgba = np.stack([arr_norm,
+                            np.zeros_like(arr_norm),
+                            arr_norm,
+                            alpha], axis=-1)
         else:
             # Use matplotlib for other colormaps
             cmap = plt.get_cmap(colormap)
             colored = (cmap(arr_norm / 255.0)[:, :, :3] * 255).astype(np.uint8)
-            img = QImage(colored.data, w, h, w * 3, QImage.Format.Format_RGB888)
-            # img = QImage(arr_norm.data, w, h, w, QImage.Format.Format_Grayscale8)
-            
+            rgba = np.concatenate([colored, alpha[..., None]], axis=-1)
+
+        img = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
         return img
