@@ -1,0 +1,7 @@
+.github/*
+data/
+build/
+
+#all pycache files and folders
+**/__pycache__/
+**/*.pyc
