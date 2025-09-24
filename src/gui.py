@@ -37,7 +37,7 @@ class ImageAligner(QMainWindow):
         
     def init_ui(self):
         self.setWindowTitle("Microscopy Image Alignment Tool")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1920, 1080)
         
         # Create central widget
         central_widget = QWidget()
