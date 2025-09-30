@@ -104,12 +104,12 @@ class TransformControls(QWidget):
         trans_layout.addWidget(QLabel("X:"))
 
         self.tx_slider = QSlider(Qt.Horizontal)
-        self.tx_slider.setRange(-500, 500)
+        self.tx_slider.setRange(-1000, 1000)
         self.tx_slider.setValue(0.)
         self.tx_slider.setSingleStep(0.1)
 
         self.tx_spin = QDoubleSpinBox()
-        self.tx_spin.setRange(-500, 500)
+        self.tx_spin.setRange(-1000, 1000)
         self.tx_spin.setSuffix(" px")
         self.tx_spin.setValue(0.)
         self.tx_spin.setSingleStep(0.1)
@@ -136,12 +136,12 @@ class TransformControls(QWidget):
         trans_layout.addWidget(QLabel("Y:"))
 
         self.ty_slider = QSlider(Qt.Horizontal)
-        self.ty_slider.setRange(-500, 500)
+        self.ty_slider.setRange(-1000, 1000)
         self.ty_slider.setValue(0.0)
         self.ty_slider.setSingleStep(0.1)
 
         self.ty_spin = QDoubleSpinBox()
-        self.ty_spin.setRange(-500, 500)
+        self.ty_spin.setRange(-1000, 1000)
         self.ty_spin.setSuffix(" px")
         self.ty_spin.setValue(0.0)
         self.ty_spin.setSingleStep(0.1)
