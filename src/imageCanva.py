@@ -27,6 +27,18 @@ class ImageCanvas(QGraphicsView):
         self.pending_point = None   # store template point before moving point
         self.points_items = {}      # dict of (ellipse_item, text_item)
 
+        # View settings
+        self.setRenderHints(self.renderHints() | 
+                            QPainter.Antialiasing | 
+                            QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)  # enables scrolling with mouse drag
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)  # zoom around mouse
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+
+        # Zoom parameters
+        self._zoom_factor = 1.25
+        self._current_zoom = 0
+
     def set_template(self, img_array, colormap='gray', opacity=0.5):
         """Set template (reference) image"""
         self.template_array = img_array
@@ -42,8 +54,6 @@ class ImageCanvas(QGraphicsView):
         if self.view_mode == 'overlay':
             self.template_item.setPos(0, 0)  # ensure template is at origin
             self.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
-
-
 
     def set_moving(self, img_array, colormap='green', opacity=0.5):
         """Set moving image with transformation"""
@@ -74,6 +84,24 @@ class ImageCanvas(QGraphicsView):
             self.scene.setSceneRect(0, 0, total_width, total_height)
             self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    def wheelEvent(self, event: QWheelEvent):
+        """Handle zoom with mouse wheel"""
+        if event.angleDelta().y() > 0:
+            zoom = self._zoom_factor
+            self._current_zoom += 1
+        else:
+            zoom = 1 / self._zoom_factor
+            self._current_zoom -= 1
+
+        if self._current_zoom < -10:  # optional limit
+            self._current_zoom = -10
+            return
+        elif self._current_zoom > 30:
+            self._current_zoom = 30
+            return
+
+        self.scale(zoom, zoom)
+        
     def set_view_mode(self, mode):
         """Set view mode: 'overlay' or 'side_by_side'"""
         self.view_mode = mode
