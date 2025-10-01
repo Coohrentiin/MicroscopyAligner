@@ -89,3 +89,13 @@ SPDX-License-Identifier: MIT
 ---
 
 For questions, issues, or feature requests, please open an issue or contact the maintainer.
+
+## On going work and recent features
+ 
+- [x] Add save and load transformation (CSo)
+- [x] Add zoom and scroll option (CSo)
+- [x] Add menu bar (CSo)
+- [ ] Add a pretransform managing the image centering for transformations
+- [ ] Add a preference file and option 
+- [ ] Manage appearance depending on screen resolution 
+
