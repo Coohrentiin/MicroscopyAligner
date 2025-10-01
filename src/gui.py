@@ -144,8 +144,8 @@ class ImageAligner(QMainWindow):
         export_group = QGroupBox("Export")
         export_layout = QVBoxLayout()
         
-        self.crop_check = QCheckBox("Crop to overlap")
-        self.crop_check.setChecked(True)
+        # self.crop_check = QCheckBox("Crop to overlap")
+        # self.crop_check.setChecked(True)
         
         export_btn = QPushButton("Export Transformed Image")
         export_btn.setStyleSheet("QPushButton { background-color: #FF9800; }")
@@ -155,7 +155,7 @@ class ImageAligner(QMainWindow):
         batch_btn.setStyleSheet("QPushButton { background-color: #9C27B0; }")
         batch_btn.clicked.connect(self.batch_process)
         
-        export_layout.addWidget(self.crop_check)
+        # export_layout.addWidget(self.crop_check)
         export_layout.addWidget(export_btn)
         export_layout.addWidget(batch_btn)
         export_group.setLayout(export_layout)
@@ -171,7 +171,45 @@ class ImageAligner(QMainWindow):
         
         # Status bar
         self.statusBar().showMessage("Ready to load images")
-        
+
+        # Create menu bar
+        self.setup_menubar()
+
+    def setup_menubar(self): 
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        edit_menu = menubar.addMenu("Edit")
+        # File menu actions
+        load_template_action = QAction("Load Template Image", self)
+        load_template_action.triggered.connect(self.load_template)
+        file_menu.addAction(load_template_action)
+        load_moving_action = QAction("Load Moving Image", self)
+        load_moving_action.triggered.connect(self.load_moving)
+        file_menu.addAction(load_moving_action)
+        file_menu.addSeparator()
+        save_transform_action = QAction("Save Transformation Matrix", self)
+        save_transform_action.triggered.connect(self.save_transform_matrix)
+        file_menu.addAction(save_transform_action)
+        load_transform_action = QAction("Load Transformation Matrix", self)
+        load_transform_action.triggered.connect(self.load_transform_matrix)
+        file_menu.addAction(load_transform_action)
+        file_menu.addSeparator()
+        export_image_action = QAction("Export Transformed Image", self)
+        export_image_action.triggered.connect(self.export_image)
+        file_menu.addAction(export_image_action)
+        batch_process_action = QAction("Batch Process Folder", self)
+        batch_process_action.triggered.connect(self.batch_process)
+        file_menu.addAction(batch_process_action)
+        file_menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        # Edit menu actions
+        reset_transform_action = QAction("Reset Transformation", self)
+        reset_transform_action.triggered.connect(self.transform_controls.reset_transform)
+        edit_menu.addAction(reset_transform_action)
+
+
     def load_template(self):
         """Load template (reference) image"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -499,7 +537,46 @@ class ImageAligner(QMainWindow):
                 
         self.transform_controls.set_transform(current_params)
         self.statusBar().showMessage("Optimization complete (Enhanced Correlation)")
+
+    def save_transform_matrix(self):
+        """Export the tranformation matrix as a float 32 Text file"""
+        if self.transformed_image is None:
+            QMessageBox.warning(self, "Warning", "No transformed image to export")
+            return
+            
+        file_path, filetype_ext = QFileDialog.getSaveFileName(
+            self, "Save Transformation", "", "Text File (*.txt)"
+        )
+        if file_path and not file_path.endswith('.txt'):
+            file_path += '.txt'
         
+        if file_path and self.current_transform is not None:
+            # Save matrix
+            matrix = self.current_transform.params.astype(np.float32)
+            np.savetxt(file_path, matrix, delimiter=',', fmt='%.6f')
+            self.statusBar().showMessage(f"Transformation matrix saved to: {Path(file_path).name}")        
+
+    def load_transform_matrix(self):
+        """Load a transformation matrix from a Text file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Transformation", "", "Text File (*.txt)"
+        )
+        if file_path and not file_path.endswith('.txt'):
+            file_path += '.txt'
+        if file_path:
+            try:
+                matrix = np.loadtxt(file_path, delimiter=',').astype(np.float32)
+                if matrix.shape != (3, 3):
+                    raise ValueError("Invalid matrix shape")
+                    
+                transform = tf.AffineTransform(matrix=matrix)
+                self.current_transform = transform
+                self.transform_controls.set_values_from_transform(matrix)
+                self.apply_transform(self.transform_controls.transform_params)
+                self.statusBar().showMessage(f"Loaded transformation from: {Path(file_path).name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load transformation: {e}")
+
     def export_image(self):
         """Export transformed image"""
         if self.transformed_image is None:
