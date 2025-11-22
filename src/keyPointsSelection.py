@@ -66,6 +66,13 @@ class KeyPointsSelection(QDialog):
         self.point_pairs.clear()
         self.parent().canvas.clear_keypoints()
     
+    def update_pair(self, index, template_pt, moving_pt):
+        """Update an existing point pair."""
+        if 0 <= index < len(self.point_pairs):
+            self.point_pairs[index] = (template_pt, moving_pt)
+            item_text = f"T: ({template_pt[0]:.1f},{template_pt[1]:.1f}) | M: ({moving_pt[0]:.1f},{moving_pt[1]:.1f})"
+            self.points_list.item(index).setText(item_text)
+    
     def closeEvent(self, event):
         print("KeyPointsSelection closed")
         parent = self.parent()

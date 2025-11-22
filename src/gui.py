@@ -15,6 +15,7 @@ from autoAlignersGui import BruteForceDialog
 from imageCanva import ImageCanvas
 from transformControls import TransformControls
 from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints
+from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection
 from utils_images import load_imgfile
 
 from skimage.registration import phase_cross_correlation
@@ -127,7 +128,7 @@ class ImageAligner(QMainWindow):
         opt_layout = QVBoxLayout()
         
         self.opt_method = QComboBox()
-        self.opt_method.addItems(["Manual Pairs of Points","Phase Cross-Correlation","Brute Force"]) #["Manual Pairs of Points","Phase Cross-Correlation", "Brute Force", "Enhanced Correlation"]
+        self.opt_method.addItems(["Manual Pairs of Points", "Auto Detect Keypoints", "Phase Cross-Correlation", "Brute Force"]) #["Manual Pairs of Points","Phase Cross-Correlation", "Brute Force", "Enhanced Correlation"]
         
         optimize_btn = QPushButton("Optimize Alignment")
         optimize_btn.setStyleSheet("QPushButton { background-color: #2196F3; }")
@@ -313,6 +314,63 @@ class ImageAligner(QMainWindow):
         #Remove the overlay
         overlay.deleteLater()
 
+    def open_auto_keypoints_tool(self):
+        """Open automatic keypoint detection and selection tool."""
+        if self.template_image is None or self.moving_image is None:
+            QMessageBox.warning(self, "Warning", "Load both images first")
+            return
+        
+        # Force side by side mode for keypoint selection
+        self.onViewModeChanged("side_by_side")
+        self.canvas.enable_keypoint_mode(False)  # No manual clicking needed
+        
+        # Use transformed image if available, otherwise use original moving image
+        moving_img_for_detection = self.transformed_image if self.transformed_image is not None else self.moving_image
+        
+        # Create dialog with images
+        self.auto_keypoints_dialog = KeyPointsDetectionAndSelection(
+            self, self.template_image, moving_img_for_detection
+        )
+        
+        self.statusBar().showMessage("Configure and detect keypoints automatically.")
+        self.auto_keypoints_dialog.show()  # non-blocking
+        
+        # Freeze the transform controls while working with keypoints
+        self.transform_controls.setEnabled(False)
+        overlay = QFrame(self.transform_controls)
+        overlay.setStyleSheet("background-color: rgba(85, 85, 85, 0.5);")
+        overlay.setGeometry(self.transform_controls.rect())
+        overlay.raise_()
+        overlay.show()
+        
+        if self.auto_keypoints_dialog.exec() == QDialog.Accepted:
+            # User clicked Done → get the pairs
+            pairs = self.auto_keypoints_dialog.point_pairs
+            print("Collected pairs:", len(pairs))
+            self.canvas.clear_keypoints()
+            
+            if len(pairs) > 0:
+                matrix = estimate_transform_keypoints(pairs)
+                print("Estimated transformation matrix:\n", matrix)
+                self.opt_transform = matrix
+                transform = tf.AffineTransform(matrix=matrix)
+                
+                # Combine with current matrix if exists
+                if self.current_transform is not None:
+                    matrix = np.dot(transform.params, self.current_transform.params)
+                    transform = tf.AffineTransform(matrix=matrix)
+                    
+                print(f"Transform matrix:\n{transform.params}")
+                self.onViewModeChanged("overlay")
+                self.transform_controls.set_values_from_transform(transform.params)
+                self.statusBar().showMessage(f"Estimated transform from {len(pairs)} detected keypoint pairs.")
+            else:
+                self.statusBar().showMessage("No keypoint pairs detected. Operation cancelled.")
+        
+        # Release the transform controls
+        self.transform_controls.setEnabled(True)
+        overlay.deleteLater()
+
     def apply_transform(self, params):
         """Apply transformation to moving image"""
         if self.moving_image is None:
@@ -367,6 +425,8 @@ class ImageAligner(QMainWindow):
         
         if method == "Manual Pairs of Points":
             self.open_keypoints_tool()
+        elif method == "Auto Detect Keypoints":
+            self.open_auto_keypoints_tool()
         elif method == "Phase Cross-Correlation":
             self.optimize_phase_correlation()
         elif method == "Brute Force":
