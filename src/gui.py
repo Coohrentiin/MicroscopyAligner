@@ -34,7 +34,11 @@ class ImageAligner(QMainWindow):
         self.transformed_image = None
         self.current_transform = None
         self.opt_transform = None
+        self.optimizer_dialog_open = False
+        self.keypoints_dialog = None
+        self.auto_keypoints_dialog = None
         self.init_ui()
+        self.update_canvas_drag_state()
         
     def init_ui(self):
         self.setWindowTitle("Microscopy Image Alignment Tool")
@@ -108,6 +112,7 @@ class ImageAligner(QMainWindow):
         # Canvas
         self.canvas = ImageCanvas()
         self.canvas.setMinimumSize(600, 600)
+        self.canvas.template_dragged.connect(self.on_template_drag)
         
         left_layout.addLayout(img_controls)
         left_layout.addLayout(color_controls)
@@ -175,6 +180,7 @@ class ImageAligner(QMainWindow):
 
         # Create menu bar
         self.setup_menubar()
+        self.update_canvas_drag_state()
 
     def setup_menubar(self): 
         menubar = self.menuBar()
@@ -228,6 +234,7 @@ class ImageAligner(QMainWindow):
             self.statusBar().showMessage(f"Loaded template: {Path(file_path).name}")
         if self.template_image is not None:
             self.load_template_btn.setStyleSheet(f"QPushButton {{ background-color: {QApplication.instance().palette().button().color().name()}; }}")
+        self.update_canvas_drag_state()
 
     def load_moving(self):
         """Load moving image"""
@@ -248,6 +255,7 @@ class ImageAligner(QMainWindow):
         # When loading a new moving image, apply current transform if available
         if self.current_transform is not None:
             self.apply_transform(self.transform_controls.transform_params)
+        self.update_canvas_drag_state()
         
     def onViewModeChanged(self, mode):
         """Handle view mode change"""
@@ -266,11 +274,13 @@ class ImageAligner(QMainWindow):
             self.moving_opacity.setEnabled(False)
             self.canvas.set_view_mode(mode)
         self.update_display()
+        self.update_canvas_drag_state()
 
     def open_keypoints_tool(self):
         if self.template_image is None or self.moving_image is None:
             QMessageBox.warning(self, "Warning", "Load both images first")
             return
+        self.set_optimizer_dialog_state(True)
         # Force side by side mode for keypoint selection
         self.onViewModeChanged("side_by_side")
         self.canvas.enable_keypoint_mode(True)
@@ -289,7 +299,8 @@ class ImageAligner(QMainWindow):
         overlay.raise_()
         overlay.show()
 
-        if self.keypoints_dialog.exec() == QDialog.Accepted:
+        result = self.keypoints_dialog.exec()
+        if result == QDialog.Accepted:
             # User clicked Done → get the pairs
             pairs = self.keypoints_dialog.point_pairs
             print("Collected pairs:", pairs)
@@ -314,12 +325,15 @@ class ImageAligner(QMainWindow):
         self.transform_controls.setEnabled(True)
         #Remove the overlay
         overlay.deleteLater()
+        self.keypoints_dialog = None
+        self.set_optimizer_dialog_state(False)
 
     def open_auto_keypoints_tool(self):
         """Open automatic keypoint detection and selection tool."""
         if self.template_image is None or self.moving_image is None:
             QMessageBox.warning(self, "Warning", "Load both images first")
             return
+        self.set_optimizer_dialog_state(True)
         
         # Force side by side mode for keypoint selection
         self.onViewModeChanged("side_by_side")
@@ -344,7 +358,8 @@ class ImageAligner(QMainWindow):
         overlay.raise_()
         overlay.show()
         
-        if self.auto_keypoints_dialog.exec() == QDialog.Accepted:
+        result = self.auto_keypoints_dialog.exec()
+        if result == QDialog.Accepted:
             # User clicked Done → get the pairs
             pairs = self.auto_keypoints_dialog.point_pairs
             print("Collected pairs:", len(pairs))
@@ -371,6 +386,8 @@ class ImageAligner(QMainWindow):
         # Release the transform controls
         self.transform_controls.setEnabled(True)
         overlay.deleteLater()
+        self.auto_keypoints_dialog = None
+        self.set_optimizer_dialog_state(False)
 
     def apply_transform(self, params):
         """Apply transformation to moving image"""
@@ -483,7 +500,10 @@ class ImageAligner(QMainWindow):
     def optimize_brute_force(self):
         """Brute force optimization with user-defined ranges"""
         dialog = BruteForceDialog(self, current_params=self.transform_controls.transform_params)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        self.set_optimizer_dialog_state(True)
+        result = dialog.exec()
+        self.set_optimizer_dialog_state(False)
+        if result == QDialog.DialogCode.Accepted:
             ranges = dialog.get_ranges()
             
             # Create progress dialog
@@ -598,6 +618,27 @@ class ImageAligner(QMainWindow):
                 
         self.transform_controls.set_transform(current_params)
         self.statusBar().showMessage("Optimization complete (Enhanced Correlation)")
+
+    def on_template_drag(self, dx, dy):
+        """Handle canvas drag events by nudging translation parameters."""
+        if (self.template_image is None or self.moving_image is None or
+                not self.canvas.template_drag_enabled):
+            return
+        # Dragging template visually corresponds to moving the transform opposite direction
+        self.transform_controls.nudge_translation(dx, dy)
+
+    def update_canvas_drag_state(self):
+        allow = (
+            self.template_image is not None and
+            self.moving_image is not None and
+            not self.optimizer_dialog_open and
+            getattr(self.canvas, 'view_mode', 'overlay') == 'overlay'
+        )
+        self.canvas.set_template_drag_enabled(allow)
+
+    def set_optimizer_dialog_state(self, active: bool):
+        self.optimizer_dialog_open = active
+        self.update_canvas_drag_state()
 
     def save_transform_matrix(self):
         """Export the tranformation matrix as a float 32 Text file"""

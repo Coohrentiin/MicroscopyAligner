@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 class ImageCanvas(QGraphicsView):
     """Custom canvas for displaying overlaid images"""
     point_added = Signal(tuple, tuple)  # (template_point, moving_point)
+    template_dragged = Signal(float, float)  # delta x, delta y in scene coords
 
     def __init__(self):
         super().__init__()
@@ -30,6 +31,9 @@ class ImageCanvas(QGraphicsView):
         # For dragging keypoints
         self.dragging_point = None  # (point_number, is_template)
         self.drag_start_pos = None
+        self.template_drag_enabled = False
+        self.template_drag_active = False
+        self._last_drag_scene_pos = None
 
         # View settings
         self.setRenderHints(self.renderHints() | 
@@ -129,10 +133,28 @@ class ImageCanvas(QGraphicsView):
         if not enabled:
             self.clear_keypoints()
 
+    def set_template_drag_enabled(self, enabled: bool):
+        """Allow translating the template via click+drag when in overlay mode."""
+        self.template_drag_enabled = enabled
+        if not enabled:
+            self.template_drag_active = False
+            self._last_drag_scene_pos = None
+            self.setCursor(Qt.ArrowCursor)
+        self.setDragMode(QGraphicsView.ScrollHandDrag if not enabled else QGraphicsView.NoDrag)
+
     def mousePressEvent(self, event):
         print("Mouse press event at:", event.pos(), "Keypoint mode:", self.keypoint_mode, "View mode:", self.view_mode)
         scene_pos = self.mapToScene(event.pos())
         x, y = scene_pos.x(), scene_pos.y()
+
+        if (event.button() == Qt.LeftButton and self.view_mode == 'overlay'
+                and self.template_drag_enabled and not self.keypoint_mode
+                and self.template_item is not None):
+            self.template_drag_active = True
+            self._last_drag_scene_pos = scene_pos
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         
         # Check if we're clicking on an existing keypoint to drag it
         if self.view_mode == "side_by_side":
@@ -171,6 +193,16 @@ class ImageCanvas(QGraphicsView):
     
     def mouseMoveEvent(self, event):
         """Handle mouse move for dragging keypoints."""
+        if self.template_drag_active and self._last_drag_scene_pos is not None:
+            scene_pos = self.mapToScene(event.pos())
+            dx = scene_pos.x() - self._last_drag_scene_pos.x()
+            dy = scene_pos.y() - self._last_drag_scene_pos.y()
+            if dx != 0 or dy != 0:
+                self.template_dragged.emit(dx, dy)
+                self._last_drag_scene_pos = scene_pos
+            event.accept()
+            return
+
         if self.dragging_point is not None:
             scene_pos = self.mapToScene(event.pos())
             x, y = scene_pos.x(), scene_pos.y()
@@ -183,6 +215,13 @@ class ImageCanvas(QGraphicsView):
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release for dropping keypoints."""
+        if self.template_drag_active:
+            self.template_drag_active = False
+            self._last_drag_scene_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+
         if self.dragging_point is not None:
             scene_pos = self.mapToScene(event.pos())
             x, y = scene_pos.x(), scene_pos.y()

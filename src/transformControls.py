@@ -265,6 +265,11 @@ class TransformControls(QWidget):
         """Set transform parameters programmatically"""
         self.set_values_from_params(params)
 
+    def nudge_translation(self, dx, dy):
+        """Incrementally adjust translation spin boxes (center-referenced)."""
+        self.tx_spin.setValue(self.tx_spin.value() + dx)
+        self.ty_spin.setValue(self.ty_spin.value() + dy)
+
     def set_template_shape(self, shape):
         """Update template reference center based on image shape."""
         if shape is None:
