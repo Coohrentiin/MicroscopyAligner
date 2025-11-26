@@ -219,6 +219,7 @@ class ImageAligner(QMainWindow):
         if file_path:
             self.template_image_file = file_path
             self.template_image = load_imgfile(file_path).astype(np.float32)
+            self.transform_controls.set_template_shape(self.template_image.shape)
             self.canvas.set_template(
                 self.template_image,
                 self.template_color.currentText(),

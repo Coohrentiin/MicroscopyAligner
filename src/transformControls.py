@@ -14,12 +14,20 @@ class TransformControls(QWidget):
     def __init__(self):
         super().__init__()
         self.init_ui()
+        self.template_center = np.array([0.0, 0.0], dtype=float)
+        self.display_params = {
+            'rotation': 0.0,
+            'scale': 1.0,
+            'tx': 0.0,
+            'ty': 0.0
+        }
         self.transform_params = {
             'rotation': 0.0,
             'scale': 1.0,
             'tx': 0.0,
             'ty': 0.0
         }
+        self.on_transform_changed()
         
     def init_ui(self):
         layout = QVBoxLayout()
@@ -208,67 +216,39 @@ class TransformControls(QWidget):
         self.rot_spin.setValue(current + angle)
         
     def on_transform_changed(self):
-        self.transform_params = {
+        self.display_params = {
             'rotation': self.rot_spin.value(),
             'scale': self.scale_spin.value(),
             'tx': self.tx_spin.value(),
             'ty': self.ty_spin.value()
         }
-        self.update_matrix_display()
+        matrix = self._params_to_affine(self.display_params)
+        self.transform_params = {
+            'rotation': self.display_params['rotation'],
+            'scale': self.display_params['scale'],
+            'tx': matrix[0, 2],
+            'ty': matrix[1, 2]
+        }
+        self.update_matrix_display(matrix)
         self.transform_changed.emit(self.transform_params)
     
     def set_values_from_transform(self, transfrom_mat):
         """Set the control values based on a given transformation matrix"""
-        # Extract parameters from the affine matrix
-        a, b, tx = transfrom_mat[0]
-        c, d, ty = transfrom_mat[1]
-        
-        scale = np.sqrt(a**2 + c**2)
-        rotation = np.degrees(np.arctan2(c, a))
-        
-        #Set value wuthout triggering signals
-        self.rot_spin.blockSignals(True)
-        self.scale_spin.blockSignals(True)
-        self.tx_spin.blockSignals(True)
-        self.ty_spin.blockSignals(True)
-        self.rot_spin.setValue(rotation)
-        self.scale_spin.setValue(scale)
-        self.tx_spin.setValue(tx)
-        self.ty_spin.setValue(ty)
-        self.rot_spin.blockSignals(False)
-        self.scale_spin.blockSignals(False)
-        self.tx_spin.blockSignals(False)
-        self.ty_spin.blockSignals(False)
+        display_params = self._affine_to_display_params(transfrom_mat)
+        self._apply_display_params(display_params)
         self.on_transform_changed()
 
     def set_values_from_params(self, params):
         """Set the control values based on given parameters dict"""
-        self.rot_spin.blockSignals(True)
-        self.scale_spin.blockSignals(True)
-        self.tx_spin.blockSignals(True)
-        self.ty_spin.blockSignals(True)
-        self.rot_spin.setValue(params.get('rotation', 0))
-        self.scale_spin.setValue(params.get('scale', 1.0))
-        self.tx_spin.setValue(params.get('tx', 0))
-        self.ty_spin.setValue(params.get('ty', 0))
-        self.rot_spin.blockSignals(False)
-        self.scale_spin.blockSignals(False)
-        self.tx_spin.blockSignals(False)
-        self.ty_spin.blockSignals(False)
+        matrix = self._top_left_params_to_matrix(params)
+        display_params = self._affine_to_display_params(matrix)
+        self._apply_display_params(display_params)
         self.on_transform_changed()
 
-    def update_matrix_display(self):
+    def update_matrix_display(self, matrix=None):
         """Update the transformation matrix display"""
-        angle_rad = np.radians(self.transform_params['rotation'])
-        s = self.transform_params['scale']
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
-        
-        matrix = np.array([
-            [s * cos_a, -s * sin_a, self.transform_params['tx']],
-            [s * sin_a, s * cos_a, self.transform_params['ty']],
-            [0, 0, 1]
-        ])
+        if matrix is None:
+            matrix = self._params_to_affine(self.display_params)
         
         matrix_str = "[\n"
         for row in matrix:
@@ -278,14 +258,92 @@ class TransformControls(QWidget):
         self.matrix_display.setPlainText(matrix_str)
         
     def reset_transform(self):
-        self.rot_spin.setValue(0)
-        self.scale_spin.setValue(1.0)
-        self.tx_spin.setValue(0)
-        self.ty_spin.setValue(0)
+        self._apply_display_params({'rotation': 0, 'scale': 1.0, 'tx': 0, 'ty': 0})
+        self.on_transform_changed()
         
     def set_transform(self, params):
         """Set transform parameters programmatically"""
-        self.rot_spin.setValue(params.get('rotation', 0))
-        self.scale_spin.setValue(params.get('scale', 1.0))
-        self.tx_spin.setValue(params.get('tx', 0))
-        self.ty_spin.setValue(params.get('ty', 0))
+        self.set_values_from_params(params)
+
+    def set_template_shape(self, shape):
+        """Update template reference center based on image shape."""
+        if shape is None:
+            self.template_center = np.array([0.0, 0.0], dtype=float)
+        else:
+            height, width = shape[:2]
+            self.template_center = np.array([width / 2.0, height / 2.0], dtype=float)
+        self.on_transform_changed()
+
+    def _apply_display_params(self, params):
+        self.display_params = {
+            'rotation': params.get('rotation', 0.0),
+            'scale': params.get('scale', 1.0),
+            'tx': params.get('tx', 0.0),
+            'ty': params.get('ty', 0.0)
+        }
+        self.rot_spin.blockSignals(True)
+        self.scale_spin.blockSignals(True)
+        self.tx_spin.blockSignals(True)
+        self.ty_spin.blockSignals(True)
+        self.rot_spin.setValue(self.display_params['rotation'])
+        self.scale_spin.setValue(self.display_params['scale'])
+        self.tx_spin.setValue(self.display_params['tx'])
+        self.ty_spin.setValue(self.display_params['ty'])
+        self.rot_spin.blockSignals(False)
+        self.scale_spin.blockSignals(False)
+        self.tx_spin.blockSignals(False)
+        self.ty_spin.blockSignals(False)
+
+    def _get_center_matrices(self):
+        cx, cy = self.template_center
+        to_center = np.array([
+            [1, 0, -cx],
+            [0, 1, -cy],
+            [0, 0, 1]
+        ], dtype=float)
+        back = np.array([
+            [1, 0, cx],
+            [0, 1, cy],
+            [0, 0, 1]
+        ], dtype=float)
+        return back, to_center
+
+    def _params_to_affine(self, params):
+        angle_rad = np.radians(params['rotation'])
+        s = params['scale']
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        base = np.array([
+            [s * cos_a, -s * sin_a, params['tx']],
+            [s * sin_a, s * cos_a, params['ty']],
+            [0, 0, 1]
+        ], dtype=float)
+        back, to_center = self._get_center_matrices()
+        return back @ base @ to_center
+
+    def _affine_to_display_params(self, matrix):
+        back, to_center = self._get_center_matrices()
+        center_matrix = to_center @ matrix @ back
+        a, b, tx = center_matrix[0]
+        c, d, ty = center_matrix[1]
+        scale = np.sqrt(a**2 + c**2)
+        if scale == 0:
+            scale = 1e-6
+        rotation = np.degrees(np.arctan2(c, a))
+        return {
+            'rotation': rotation,
+            'scale': scale,
+            'tx': tx,
+            'ty': ty
+        }
+
+    def _top_left_params_to_matrix(self, params):
+        angle_rad = np.radians(params.get('rotation', 0.0))
+        s = params.get('scale', 1.0)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        return np.array([
+            [s * cos_a, -s * sin_a, params.get('tx', 0.0)],
+            [s * sin_a, s * cos_a, params.get('ty', 0.0)],
+            [0, 0, 1]
+        ], dtype=float)
