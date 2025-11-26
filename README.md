@@ -91,7 +91,7 @@ The application provides direct control over image transformations through an in
 
 - **Rotation:** Adjust rotation angle from -180° to +180° with fine control (0.1° steps) or quick ±90° buttons
 - **Scale:** Modify uniform scaling from 0.25× to 4× to match image magnifications
-- **Translation:** Fine-tune X and Y translation with pixel-level precision using sliders or quick ±10px buttons
+- **Translation:** Fine-tune X and Y translation with pixel-level precision using sliders or quick ±10px buttons. Translation can also be adjusted by "click+drag" of the moving image.  
 
 All transformations apply a **similarity transform** (translation + rotation + uniform scale) to the moving image. The transform is applied relative to the image center, preserving the image's aspect ratio. Changes are reflected in real-time in the overlay or side-by-side view.
 
@@ -236,7 +236,8 @@ For questions, issues, or feature requests, please open an issue or contact the 
 - [x] Add menu bar (CSo)
 - [x] Add manual point editing by drag and drop (CSo)
 - [x] Add automatic keypoints detection/matching/filtering including editing (CSo)
-- [ ] Add a pretransform managing the image centering for transformations
+- [x] Add a pretransform managing the image centering for transformations (CSo)
+- [x] Add a click+drag translation of moving image. 
 - [ ] Add a preference file and option 
 - [ ] Manage appearance depending on screen resolution 
 
