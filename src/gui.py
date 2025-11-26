@@ -706,10 +706,17 @@ class ImageAligner(QMainWindow):
             elif filetype_ext in ['TIF Files (*.tif)', 'TIFF Files (*.tiff)']:
                 extension = '.tif' if filetype_ext == 'TIF Files (*.tif)' else '.tiff'
                 tifffile.imwrite(file_path + extension, img_to_save.astype(np.float32))
-            else:
+            elif file_path.endswith('.png'):
                 img_normalized = ((img_to_save - img_to_save.min()) / 
                                  (img_to_save.max() - img_to_save.min() + 1e-10) * 255).astype(np.uint8)
                 Image.fromarray(img_normalized).save(file_path)
+            elif filetype_ext in ['PNG Files (*.png)']:
+                img_normalized = ((img_to_save - img_to_save.min()) / 
+                                 (img_to_save.max() - img_to_save.min() + 1e-10) * 255).astype(np.uint8)
+                Image.fromarray(img_normalized).save(file_path + '.png')
+            else:
+                QMessageBox.warning(self, "Warning", "Unsupported file format")
+                return
                 
             self.statusBar().showMessage(f"Exported to: {Path(file_path).name}")
             
