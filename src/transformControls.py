@@ -46,12 +46,12 @@ class TransformControls(QWidget):
         self.rot_slider.setValue(0.)
         self.rot_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.rot_slider.setTickInterval(45)
-        self.rot_slider.setSingleStep(0.1)
+        self.rot_slider.setSingleStep(0.01)
         
-        self.rot_spin = QDoubleSpinBox()
+        self.rot_spin = QDoubleSpinBox(decimals=3)
         self.rot_spin.setRange(-180, 180)
         self.rot_spin.setSuffix("°")
-        self.rot_spin.setSingleStep(0.1)
+        self.rot_spin.setSingleStep(0.01)
         
         rot_buttons = QHBoxLayout()
         rot_m90 = QPushButton("-90°")
@@ -73,14 +73,14 @@ class TransformControls(QWidget):
         self.scale_slider = QSlider(Qt.Orientation.Horizontal)
         self.scale_slider.setRange(25, 400)
         self.scale_slider.setValue(100)
-        self.scale_slider.setSingleStep(0.1)    
+        self.scale_slider.setSingleStep(0.01)    
         self.scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.scale_slider.setTickInterval(50)
         
-        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin = QDoubleSpinBox(decimals=3)
         self.scale_spin.setRange(0.25, 4.0)
         self.scale_spin.setValue(1.0)
-        self.scale_spin.setSingleStep(0.1)
+        self.scale_spin.setSingleStep(0.001)
         self.scale_spin.setPrefix("×")
         
         scale_layout.addWidget(self.scale_slider)
@@ -116,7 +116,7 @@ class TransformControls(QWidget):
         self.tx_slider.setValue(0.)
         self.tx_slider.setSingleStep(0.1)
 
-        self.tx_spin = QDoubleSpinBox()
+        self.tx_spin = QDoubleSpinBox(decimals=3)
         self.tx_spin.setRange(-1000, 1000)
         self.tx_spin.setSuffix(" px")
         self.tx_spin.setValue(0.)
@@ -148,7 +148,7 @@ class TransformControls(QWidget):
         self.ty_slider.setValue(0.0)
         self.ty_slider.setSingleStep(0.1)
 
-        self.ty_spin = QDoubleSpinBox()
+        self.ty_spin = QDoubleSpinBox(decimals=3)
         self.ty_spin.setRange(-1000, 1000)
         self.ty_spin.setSuffix(" px")
         self.ty_spin.setValue(0.0)

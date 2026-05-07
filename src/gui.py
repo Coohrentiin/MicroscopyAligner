@@ -16,7 +16,7 @@ from imageCanva import ImageCanvas
 from transformControls import TransformControls
 from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints
 from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection
-from utils_images import load_imgfile
+from utils_images import load_imgfile, load_wavefront_tif, save_stack
 
 from skimage.registration import phase_cross_correlation
 import cv2
@@ -215,6 +215,9 @@ class ImageAligner(QMainWindow):
         reset_transform_action = QAction("Reset Transformation", self)
         reset_transform_action.triggered.connect(self.transform_controls.reset_transform)
         edit_menu.addAction(reset_transform_action)
+        load_export_stack_action = QAction("Apply transform to a ImageJ stack", self)
+        load_export_stack_action.triggered.connect(self.load_and_export_stack)
+        edit_menu.addAction(load_export_stack_action)
 
 
     def load_template(self):
@@ -719,7 +722,82 @@ class ImageAligner(QMainWindow):
                 return
                 
             self.statusBar().showMessage(f"Exported to: {Path(file_path).name}")
-            
+
+    def load_and_export_stack(self):
+        """Apply the current transform to every frame of an ImageJ wavefront
+        stack and save the result with the same channel layout."""
+        if self.current_transform is None:
+            QMessageBox.warning(self, "Warning", "Please set up a transformation first")
+            return
+
+        in_path, _ = QFileDialog.getOpenFileName(
+            self, "Load ImageJ Stack", "", "TIFF Files (*.tif *.tiff)"
+        )
+        if not in_path:
+            return
+
+        out_path, filetype_ext = QFileDialog.getSaveFileName(
+            self, "Save Transformed Stack", "", "TIFF Files (*.tif *.tiff)"
+        )
+        if not out_path:
+            return
+        if not (out_path.endswith('.tif') or out_path.endswith('.tiff')):
+            out_path += '.tif'
+
+        try:
+            _, _, n_frames = load_wavefront_tif(in_path, frame_index=0)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load stack: {e}")
+            return
+
+        ref_shape = (
+            self.template_image.shape if self.template_image is not None else None
+        )
+
+        progress = QProgressDialog(
+            "Processing stack frames...", "Cancel", 0, n_frames, self
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        frames = []
+        for t in range(n_frames):
+            if progress.wasCanceled():
+                self.statusBar().showMessage("Stack export canceled")
+                return
+            try:
+                phase, amp, _ = load_wavefront_tif(in_path, frame_index=t)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to read frame {t}: {e}")
+                return
+
+            output_shape = ref_shape if ref_shape is not None else phase.shape
+            phase_t = tf.warp(
+                phase, self.current_transform.inverse,
+                output_shape=output_shape, preserve_range=True,
+            ).astype(np.float32)
+            amp_t = tf.warp(
+                amp, self.current_transform.inverse,
+                output_shape=output_shape, preserve_range=True,
+            ).astype(np.float32)
+
+            # Channel order matches load_wavefront_tif: 0=phase, 1=amplitude
+            frames.append(np.stack([phase_t, amp_t], axis=-1))
+            progress.setValue(t + 1)
+            QApplication.processEvents()
+
+        stack = np.stack(frames, axis=0)  # (N, H, W, 2)
+
+        try:
+            save_stack(out_path, stack, source_path=in_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save stack: {e}")
+            return
+
+        self.statusBar().showMessage(
+            f"Exported transformed stack ({n_frames} frames) to: {Path(out_path).name}"
+        )
+
     def batch_process(self):
         """Apply transformation to a folder of images"""
         if self.current_transform is None:

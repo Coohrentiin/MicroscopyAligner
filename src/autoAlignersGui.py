@@ -21,7 +21,7 @@ class BruteForceDialog(QDialog):
         
         # Rotation range
         params_layout.addWidget(QLabel("Rotation Range (°):"), 0, 0)
-        self.rot_min = QSpinBox()
+        self.rot_min = QSpinBox(decimals=3)
         self.rot_min.setRange(-45, 45)
         if current_params is not None:
             self.rot_min.setValue(int(current_params.get('rotation', 0)) - 10)
@@ -30,7 +30,7 @@ class BruteForceDialog(QDialog):
         params_layout.addWidget(self.rot_min, 0, 1)
         
         params_layout.addWidget(QLabel("to"), 0, 2)
-        self.rot_max = QSpinBox()
+        self.rot_max = QDoubleSpinBox(decimals=3)
         self.rot_max.setRange(-45, 45)
         if current_params is not None:
             self.rot_max.setValue(int(current_params.get('rotation', 0)) + 10)
@@ -46,7 +46,7 @@ class BruteForceDialog(QDialog):
         
         # Scale range
         params_layout.addWidget(QLabel("Scale Range:"), 1, 0)
-        self.scale_min = QDoubleSpinBox()
+        self.scale_min = QDoubleSpinBox(decimals=3)
         self.scale_min.setRange(0.5, 2.0)
         if current_params is not None:
             self.scale_min.setValue(current_params.get('scale', 1.0) - 0.1)
@@ -56,7 +56,7 @@ class BruteForceDialog(QDialog):
         params_layout.addWidget(self.scale_min, 1, 1)
         
         params_layout.addWidget(QLabel("to"), 1, 2)
-        self.scale_max = QDoubleSpinBox()
+        self.scale_max = QDoubleSpinBox(decimals=3)
         self.scale_max.setRange(0.5, 2.0)
         if current_params is not None:
             self.scale_max.setValue(current_params.get('scale', 1.0) + 0.1)
@@ -73,7 +73,7 @@ class BruteForceDialog(QDialog):
         
         # Translation X range
         params_layout.addWidget(QLabel("Translation X (px):"), 2, 0)
-        self.tx_min = QSpinBox()
+        self.tx_min = QDoubleSpinBox(decimals=3)
         self.tx_min.setRange(-100, 100)
         if current_params is not None:
             self.tx_min.setValue(current_params.get('tx', 0) - 10)
@@ -82,7 +82,7 @@ class BruteForceDialog(QDialog):
         params_layout.addWidget(self.tx_min, 2, 1)
         
         params_layout.addWidget(QLabel("to"), 2, 2)
-        self.tx_max = QSpinBox()
+        self.tx_max = QDoubleSpinBox(decimals=3)
         self.tx_max.setRange(-100, 100)
         if current_params is not None:
             self.tx_max.setValue(current_params.get('tx', 0) + 10)
@@ -98,7 +98,7 @@ class BruteForceDialog(QDialog):
         
         # Translation Y range
         params_layout.addWidget(QLabel("Translation Y (px):"), 3, 0)
-        self.ty_min = QSpinBox()
+        self.ty_min = QDoubleSpinBox(decimals=3)
         self.ty_min.setRange(-100, 100)
         if current_params is not None:
             self.ty_min.setValue(current_params.get('ty', 0) - 10)
@@ -107,7 +107,7 @@ class BruteForceDialog(QDialog):
         params_layout.addWidget(self.ty_min, 3, 1)
         
         params_layout.addWidget(QLabel("to"), 3, 2)
-        self.ty_max = QSpinBox()
+        self.ty_max = QDoubleSpinBox(decimals=3)
         self.ty_max.setRange(-100, 100)
         if current_params is not None:
             self.ty_max.setValue(current_params.get('ty', 0) + 10)
