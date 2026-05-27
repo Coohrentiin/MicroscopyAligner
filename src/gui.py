@@ -15,7 +15,7 @@ from autoAlignersGui import BruteForceDialog
 from imageCanva import ImageCanvas
 from transformControls import TransformControls
 from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints
-from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection
+from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection, detect_keypoint_pairs
 from utils_images import load_imgfile, load_wavefront_tif, save_stack
 
 from skimage.registration import phase_cross_correlation
@@ -37,6 +37,8 @@ class ImageAligner(QMainWindow):
         self.optimizer_dialog_open = False
         self.keypoints_dialog = None
         self.auto_keypoints_dialog = None
+        self.batch_panel = None
+        self.progressive_panel = None
         self.init_ui()
         self.update_canvas_drag_state()
         
@@ -207,6 +209,12 @@ class ImageAligner(QMainWindow):
         batch_process_action = QAction("Batch Process Folder", self)
         batch_process_action.triggered.connect(self.batch_process)
         file_menu.addAction(batch_process_action)
+        open_batch_mode_action = QAction("Open Batch Mode Panel", self)
+        open_batch_mode_action.triggered.connect(self.open_batch_mode)
+        file_menu.addAction(open_batch_mode_action)
+        open_progressive_action = QAction("Open Progressive Folder Alignment", self)
+        open_progressive_action.triggered.connect(self.open_progressive_folder)
+        file_menu.addAction(open_progressive_action)
         file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -226,17 +234,27 @@ class ImageAligner(QMainWindow):
             self, "Load Template Image", "", "Image Files (*.tif *.tiff *.png *.jpg)"
         )
         if file_path:
-            self.template_image_file = file_path
-            self.template_image = load_imgfile(file_path).astype(np.float32)
-            self.transform_controls.set_template_shape(self.template_image.shape)
-            self.canvas.set_template(
-                self.template_image,
-                self.template_color.currentText(),
-                self.template_opacity.value() / 100
-            )
-            self.statusBar().showMessage(f"Loaded template: {Path(file_path).name}")
-        if self.template_image is not None:
-            self.load_template_btn.setStyleSheet(f"QPushButton {{ background-color: {QApplication.instance().palette().button().color().name()}; }}")
+            self.load_template_from_path(file_path)
+
+    def load_template_from_path(self, file_path):
+        """Load template (reference) image from an explicit path (no dialog)."""
+        self.set_template_array(load_imgfile(file_path).astype(np.float32), file_path)
+        self.statusBar().showMessage(f"Loaded template: {Path(file_path).name}")
+
+    def set_template_array(self, arr, source_path):
+        """Set the template (reference) image from an in-memory array (no file
+        read). Used by Progressive Folder Alignment's sliding mode to push the
+        per-image reference frame (image N-X) in as the alignment reference.
+        """
+        self.template_image_file = source_path
+        self.template_image = arr.astype(np.float32)
+        self.transform_controls.set_template_shape(self.template_image.shape)
+        self.canvas.set_template(
+            self.template_image,
+            self.template_color.currentText(),
+            self.template_opacity.value() / 100
+        )
+        self.load_template_btn.setStyleSheet(f"QPushButton {{ background-color: {QApplication.instance().palette().button().color().name()}; }}")
         self.update_canvas_drag_state()
 
     def load_moving(self):
@@ -245,16 +263,29 @@ class ImageAligner(QMainWindow):
             self, "Load Moving Image", "", "Image Files (*.tif *.tiff *.png *.jpg)"
         )
         if file_path:
-            self.moving_image_file = file_path
-            self.moving_image = load_imgfile(file_path).astype(np.float32)
-            self.canvas.set_moving(
-                self.moving_image,
-                self.moving_color.currentText(),
-                self.moving_opacity.value() / 100
-            )
-            self.statusBar().showMessage(f"Loaded moving image: {Path(file_path).name}")
-        if self.moving_image is not None:
-            self.load_moving_btn.setStyleSheet(f"QPushButton {{ background-color: {QApplication.instance().palette().button().color().name()}; }}")
+            self.load_moving_from_path(file_path)
+
+    def load_moving_from_path(self, file_path):
+        """Load moving image from an explicit path (no dialog)."""
+        self.set_moving_array(load_imgfile(file_path).astype(np.float32), file_path)
+        self.statusBar().showMessage(f"Loaded moving image: {Path(file_path).name}")
+
+    def set_moving_array(self, arr, source_path):
+        """Set the moving image from an in-memory array (no file read).
+
+        Refreshes the canvas and re-applies the current transform if any. Used
+        by Progressive Folder Alignment to push a stack's representative frame
+        in directly. ``source_path`` is recorded as ``moving_image_file`` so
+        exports keep the original name/extension.
+        """
+        self.moving_image_file = source_path
+        self.moving_image = arr.astype(np.float32)
+        self.canvas.set_moving(
+            self.moving_image,
+            self.moving_color.currentText(),
+            self.moving_opacity.value() / 100
+        )
+        self.load_moving_btn.setStyleSheet(f"QPushButton {{ background-color: {QApplication.instance().palette().button().color().name()}; }}")
         # When loading a new moving image, apply current transform if available
         if self.current_transform is not None:
             self.apply_transform(self.transform_controls.transform_params)
@@ -391,6 +422,44 @@ class ImageAligner(QMainWindow):
         overlay.deleteLater()
         self.auto_keypoints_dialog = None
         self.set_optimizer_dialog_state(False)
+
+    def auto_keypoints_headless(self, detector="AKAZE", matcher="Brute Force",
+                                max_features=500, distance_ratio=0.75,
+                                use_ransac=True, ransac_threshold=5.0):
+        """Run automatic keypoint alignment without opening the dialog.
+
+        Mirrors the matrix-combination logic of ``open_auto_keypoints_tool`` so
+        batch mode can align headlessly. Returns the number of pairs used.
+        """
+        if self.template_image is None or self.moving_image is None:
+            QMessageBox.warning(self, "Warning", "Load both images first")
+            return 0
+
+        moving_img_for_detection = (
+            self.transformed_image if self.transformed_image is not None
+            else self.moving_image
+        )
+        pairs = detect_keypoint_pairs(
+            self.template_image, moving_img_for_detection,
+            detector=detector, matcher=matcher, max_features=max_features,
+            distance_ratio=distance_ratio, use_ransac=use_ransac,
+            ransac_threshold=ransac_threshold,
+        )
+        if len(pairs) == 0:
+            self.statusBar().showMessage("Auto keypoints: no pairs detected (transform unchanged).")
+            return 0
+
+        matrix = estimate_transform_keypoints(pairs)
+        self.opt_transform = matrix
+        transform = tf.AffineTransform(matrix=matrix)
+        if self.current_transform is not None:
+            matrix = np.dot(transform.params, self.current_transform.params)
+            transform = tf.AffineTransform(matrix=matrix)
+        self.onViewModeChanged("overlay")
+        self.transform_controls.set_values_from_transform(transform.params)
+        self.statusBar().showMessage(
+            f"Auto keypoints (headless): estimated transform from {len(pairs)} pairs.")
+        return len(pairs)
 
     def apply_transform(self, params):
         """Apply transformation to moving image"""
@@ -723,6 +792,38 @@ class ImageAligner(QMainWindow):
                 
             self.statusBar().showMessage(f"Exported to: {Path(file_path).name}")
 
+    def _warp_moving_for_export(self):
+        """Re-warp the moving image at full resolution for export, or None."""
+        if self.current_transform is None or self.moving_image is None:
+            return None
+        return tf.warp(
+            self.moving_image,
+            self.current_transform.inverse,
+            output_shape=self.template_image.shape if self.template_image is not None else self.moving_image.shape,
+            preserve_range=True
+        ).astype(np.float32)
+
+    def save_image_to_folder(self, folder, suffix=""):
+        """Save the transformed moving image to ``folder`` keeping its original
+        name plus ``suffix`` and extension (no dialog). For batch mode."""
+        img_to_save = self._warp_moving_for_export()
+        if img_to_save is None:
+            QMessageBox.warning(self, "Warning", "No transformed image to export")
+            return
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        src = Path(self.moving_image_file) if self.moving_image_file else Path("moving.tif")
+        ext = src.suffix.lower() if src.suffix else ".tif"
+        out_path = out_dir / f"{src.stem}{suffix}{ext}"
+
+        if ext in ('.tif', '.tiff'):
+            tifffile.imwrite(str(out_path), img_to_save.astype(np.float32))
+        else:  # png/jpg -> normalize to 8-bit
+            img_normalized = ((img_to_save - img_to_save.min()) /
+                              (img_to_save.max() - img_to_save.min() + 1e-10) * 255).astype(np.uint8)
+            Image.fromarray(img_normalized).save(str(out_path))
+        self.statusBar().showMessage(f"Exported to: {out_path.name}")
+
     def load_and_export_stack(self):
         """Apply the current transform to every frame of an ImageJ wavefront
         stack and save the result with the same channel layout."""
@@ -735,6 +836,14 @@ class ImageAligner(QMainWindow):
         )
         if not in_path:
             return
+        self.export_stack_from_path(in_path)
+
+    def export_stack_from_path(self, in_path):
+        """Apply the current transform to every frame of the given ImageJ wavefront
+        stack file and save the result (prompts only for the output path)."""
+        if self.current_transform is None:
+            QMessageBox.warning(self, "Warning", "Please set up a transformation first")
+            return
 
         out_path, filetype_ext = QFileDialog.getSaveFileName(
             self, "Save Transformed Stack", "", "TIFF Files (*.tif *.tiff)"
@@ -743,7 +852,22 @@ class ImageAligner(QMainWindow):
             return
         if not (out_path.endswith('.tif') or out_path.endswith('.tiff')):
             out_path += '.tif'
+        self._process_and_save_stack(in_path, out_path)
 
+    def export_stack_to_folder(self, in_path, folder, suffix=""):
+        """Apply the current transform to the stack at ``in_path`` and save it to
+        ``folder`` as ``<stem><suffix>.tif`` (no dialog). For batch mode."""
+        if self.current_transform is None:
+            QMessageBox.warning(self, "Warning", "Please set up a transformation first")
+            return
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(in_path).stem
+        out_path = str(out_dir / f"{stem}{suffix}.tif")
+        self._process_and_save_stack(in_path, out_path)
+
+    def _process_and_save_stack(self, in_path, out_path):
+        """Warp every frame of the wavefront stack at ``in_path`` and write ``out_path``."""
         try:
             _, _, n_frames = load_wavefront_tif(in_path, frame_index=0)
         except Exception as e:
@@ -835,7 +959,7 @@ class ImageAligner(QMainWindow):
                 break
                 
             # Load image
-            img = self.load_image(str(img_file))
+            img = load_imgfile(str(img_file)).astype(np.float32)
             
             # Apply transformation
             transformed = tf.warp(
@@ -858,4 +982,22 @@ class ImageAligner(QMainWindow):
             QApplication.processEvents()
             
         self.statusBar().showMessage(f"Batch processing complete. Processed {len(image_files)} images")
+
+    def open_batch_mode(self):
+        """Open the Batch Mode panel that drives this window across many images."""
+        from batchMode import BatchModePanel
+        if self.batch_panel is None:
+            self.batch_panel = BatchModePanel(self)
+        self.batch_panel.show()
+        self.batch_panel.raise_()
+        self.batch_panel.activateWindow()
+
+    def open_progressive_folder(self):
+        """Open the Progressive Folder Alignment panel that drives this window."""
+        from progressiveFolderAlignment import ProgressiveFolderPanel
+        if self.progressive_panel is None:
+            self.progressive_panel = ProgressiveFolderPanel(self)
+        self.progressive_panel.show()
+        self.progressive_panel.raise_()
+        self.progressive_panel.activateWindow()
   

@@ -11,6 +11,114 @@ from PySide6.QtGui import *
 from keyPointsSelection import estimate_transform_keypoints
 
 
+def detect_keypoints(image, method, max_features=500):
+    """Detect keypoints and compute descriptors using the specified method.
+
+    Standalone (Qt-free) so it can run headlessly from batch mode.
+    """
+    # Normalize image to uint8
+    if image.dtype != np.uint8:
+        img_norm = ((image - image.min()) / (image.max() - image.min() + 1e-10) * 255).astype(np.uint8)
+    else:
+        img_norm = image
+
+    if method == "AKAZE":
+        detector = cv2.AKAZE_create()
+    elif method == "KAZE":
+        detector = cv2.KAZE_create()
+    elif method == "SIFT":
+        detector = cv2.SIFT_create(nfeatures=max_features)
+    elif method == "ORB":
+        detector = cv2.ORB_create(nfeatures=max_features)
+    elif method == "BRISK":
+        detector = cv2.BRISK_create()
+    else:
+        raise ValueError(f"Unknown detection method: {method}")
+
+    keypoints, descriptors = detector.detectAndCompute(img_norm, None)
+
+    # Limit number of keypoints if not SIFT/ORB (they have built-in limits)
+    if method not in ["SIFT", "ORB"] and len(keypoints) > max_features:
+        keypoints = sorted(keypoints, key=lambda x: x.response, reverse=True)[:max_features]
+        descriptors = descriptors[:max_features]
+
+    return keypoints, descriptors
+
+
+def match_keypoints(desc1, desc2, method, distance_ratio=0.75):
+    """Match descriptors with Lowe's ratio test. Standalone (Qt-free)."""
+    if desc1 is None or desc2 is None:
+        return []
+
+    if desc1.dtype == np.uint8:
+        norm_type = cv2.NORM_HAMMING  # binary descriptors (ORB, BRISK, AKAZE)
+    else:
+        norm_type = cv2.NORM_L2       # float descriptors (SIFT, KAZE)
+
+    if method == "Brute Force":
+        matcher = cv2.BFMatcher(norm_type, crossCheck=False)
+    elif method == "FLANN":
+        if norm_type == cv2.NORM_HAMMING:
+            FLANN_INDEX_LSH = 6
+            index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6,
+                                key_size=12, multi_probe_level=1)
+        else:
+            FLANN_INDEX_KDTREE = 1
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+        search_params = dict(checks=50)
+        matcher = cv2.FlannBasedMatcher(index_params, search_params)
+    else:
+        raise ValueError(f"Unknown matching method: {method}")
+
+    matches = matcher.knnMatch(desc1, desc2, k=2)
+    good_matches = []
+    for match_pair in matches:
+        if len(match_pair) == 2:
+            m, n = match_pair
+            if m.distance < distance_ratio * n.distance:
+                good_matches.append(m)
+    return good_matches
+
+
+def filter_with_ransac(template_pts, moving_pts, threshold):
+    """Filter matched points using RANSAC homography. Standalone (Qt-free)."""
+    if len(template_pts) < 4:
+        return template_pts, moving_pts
+    _, mask = cv2.findHomography(moving_pts, template_pts, cv2.RANSAC,
+                                 ransacReprojThreshold=threshold)
+    if mask is None:
+        return template_pts, moving_pts
+    mask = mask.ravel().astype(bool)
+    return template_pts[mask], moving_pts[mask]
+
+
+def detect_keypoint_pairs(template_image, moving_image, detector="AKAZE",
+                          matcher="Brute Force", max_features=500,
+                          distance_ratio=0.75, use_ransac=True,
+                          ransac_threshold=5.0):
+    """Run the full detect -> match -> (RANSAC) pipeline headlessly.
+
+    Returns a list of ``(template_point, moving_point)`` tuples (possibly empty).
+    """
+    kp_t, desc_t = detect_keypoints(template_image, detector, max_features)
+    kp_m, desc_m = detect_keypoints(moving_image, detector, max_features)
+    if len(kp_t) == 0 or len(kp_m) == 0:
+        return []
+
+    matches = match_keypoints(desc_t, desc_m, matcher, distance_ratio)
+    if len(matches) == 0:
+        return []
+
+    template_pts = np.float32([kp_t[m.queryIdx].pt for m in matches])
+    moving_pts = np.float32([kp_m[m.trainIdx].pt for m in matches])
+    if use_ransac:
+        template_pts, moving_pts = filter_with_ransac(
+            template_pts, moving_pts, ransac_threshold)
+
+    return [(tuple(template_pts[i]), tuple(moving_pts[i]))
+            for i in range(len(template_pts))]
+
+
 class KeyPointsDetectionAndSelection(QDialog):
     """Dialog to detect, match, and manage automatic keypoint pairs for alignment."""
 
@@ -213,106 +321,16 @@ class KeyPointsDetectionAndSelection(QDialog):
             QApplication.restoreOverrideCursor()
 
     def detect_keypoints(self, image, method):
-        """Detect keypoints and compute descriptors using the specified method."""
-        # Normalize image to uint8
-        if image.dtype != np.uint8:
-            img_norm = ((image - image.min()) / (image.max() - image.min() + 1e-10) * 255).astype(np.uint8)
-        else:
-            img_norm = image
-        
-        # Select detector
-        if method == "AKAZE":
-            detector = cv2.AKAZE_create()
-        elif method == "KAZE":
-            detector = cv2.KAZE_create()
-        elif method == "SIFT":
-            detector = cv2.SIFT_create(nfeatures=self.max_features.value())
-        elif method == "ORB":
-            detector = cv2.ORB_create(nfeatures=self.max_features.value())
-        elif method == "BRISK":
-            detector = cv2.BRISK_create()
-        else:
-            raise ValueError(f"Unknown detection method: {method}")
-        
-        # Detect and compute
-        keypoints, descriptors = detector.detectAndCompute(img_norm, None)
-        
-        # Limit number of keypoints if not SIFT/ORB (they have built-in limits)
-        if method not in ["SIFT", "ORB"] and len(keypoints) > self.max_features.value():
-            # Sort by response strength and keep top N
-            keypoints = sorted(keypoints, key=lambda x: x.response, reverse=True)[:self.max_features.value()]
-            # Recompute descriptors for selected keypoints
-            descriptors = descriptors[:self.max_features.value()]
-        
-        return keypoints, descriptors
+        """Detect keypoints and compute descriptors (uses widget Max Features)."""
+        return detect_keypoints(image, method, self.max_features.value())
 
     def match_keypoints(self, desc1, desc2, method):
-        """Match keypoints using the specified method."""
-        if desc1 is None or desc2 is None:
-            return []
-        
-        # Check descriptor type for matcher selection
-        if desc1.dtype == np.uint8:
-            # Binary descriptors (ORB, BRISK, AKAZE)
-            norm_type = cv2.NORM_HAMMING
-        else:
-            # Float descriptors (SIFT, KAZE)
-            norm_type = cv2.NORM_L2
-        
-        if method == "Brute Force":
-            matcher = cv2.BFMatcher(norm_type, crossCheck=False)
-        elif method == "FLANN":
-            if norm_type == cv2.NORM_HAMMING:
-                # FLANN parameters for binary descriptors
-                FLANN_INDEX_LSH = 6
-                index_params = dict(algorithm=FLANN_INDEX_LSH,
-                                   table_number=6,
-                                   key_size=12,
-                                   multi_probe_level=1)
-            else:
-                # FLANN parameters for float descriptors
-                FLANN_INDEX_KDTREE = 1
-                index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-            
-            search_params = dict(checks=50)
-            matcher = cv2.FlannBasedMatcher(index_params, search_params)
-        else:
-            raise ValueError(f"Unknown matching method: {method}")
-        
-        # Match descriptors using k-nearest neighbors
-        matches = matcher.knnMatch(desc1, desc2, k=2)
-        
-        # Apply Lowe's ratio test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < self.distance_ratio.value() * n.distance:
-                    good_matches.append(m)
-        
-        return good_matches
+        """Match keypoints (uses widget Distance Ratio)."""
+        return match_keypoints(desc1, desc2, method, self.distance_ratio.value())
 
     def filter_with_ransac(self, template_pts, moving_pts, threshold):
         """Filter matched points using RANSAC."""
-        if len(template_pts) < 4:
-            return template_pts, moving_pts
-        
-        # Use OpenCV's findHomography with RANSAC
-        _, mask = cv2.findHomography(
-            moving_pts, template_pts, 
-            cv2.RANSAC, 
-            ransacReprojThreshold=threshold
-        )
-        
-        if mask is None:
-            return template_pts, moving_pts
-        
-        # Keep only inliers
-        mask = mask.ravel().astype(bool)
-        template_pts_filtered = template_pts[mask]
-        moving_pts_filtered = moving_pts[mask]
-        
-        return template_pts_filtered, moving_pts_filtered
+        return filter_with_ransac(template_pts, moving_pts, threshold)
 
     def add_pair(self, template_pt, moving_pt):
         """Add a new point pair to the list."""
