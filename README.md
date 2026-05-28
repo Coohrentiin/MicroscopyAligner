@@ -30,6 +30,8 @@ If you like it don't forget to "⭐" this repo ;)
     - [3. Phase Cross-Correlation](#3-phase-cross-correlation)
     - [4. Brute Force Alignment for Fine Adjustment](#4-brute-force-alignment-for-fine-adjustment)
   - [Batch Processing](#batch-processing)
+  - [Batch Processing Panel](#batch-processing-panel)
+  - [Progressive Folder Alignment](#progressive-folder-alignment)
   - [Usage Example](#usage-example)
   - [Screenshots](#screenshots)
 - [Who Maintains and Contributes](#who-maintains-and-contributes)
@@ -39,7 +41,7 @@ If you like it don't forget to "⭐" this repo ;)
 
 - **Manual & Assisted Alignment:** Align images using manual keypoint selection, transformation controls, or automated optimization (phase correlation, brute force, enhanced correlation).
 - **Rich Visualization:** Overlay or side-by-side display modes, customizable colormaps, and opacity controls for clear comparison.
-- **Batch Processing:** Align and export multiple images in one go.
+- **Batch Processing:** Align and export multiple images in one go — including a dedicated **Batch Processing Panel** that loads entire folders and replays user-defined sequences of actions per image.
 - **Support for Scientific Formats:** Handles TIFF, NPY, and holographic data formats for advanced microscopy workflows.
 - **Export Options:** Save aligned images and transformation matrices for downstream analysis.
 
@@ -199,6 +201,64 @@ Total evaluations = (rotation steps) × (scale steps) × (tx steps) × (ty steps
 ### Batch Processing
 Use the batch process feature to align multiple images at once. The current tranformation will be apply to all the images of a folder. 
 
+### Batch Processing Panel
+*Avoid repeating file selection and treatment pipeline by loading entire folders and defining sequences of actions.*
+
+![Batch Processing](src/resources/batch_mode_pannel.png)
+*Batch processing pannel allow to define multiple template and moving images. By defining sequence of action it reduce repetitive operations/file loading while still keeping control via a direct feedback on the main window.*
+
+Open via **File → Open Batch Mode Panel**. The panel is a separate window that drives the main alignment window: you describe many images and the steps you want to run on each, then step through the work (or run it in one shot).
+
+**How it is laid out**
+
+1. **Sequences table.** Each *row* is one "sequence": column 1 is a template image, columns 2..N are moving images. The **+ Moving Column** button adds more moving columns. **Double-clicking a cell opens a multi-file picker** — selected files are natsorted and fill that column downward from the clicked row, **auto-adding rows as needed**, so a whole folder of one condition lands in one click.
+2. **Action sequence (per moving column).** Each moving column has its own ordered list of actions, shared across every row's image in that column. Supported actions: *set matrix values* (scale / rotation / tx / ty), *auto keypoint detection*, *cross-correlation*, *reset transform*, *save moving image*, *save on stack*. A **Copy from column** helper duplicates another column's sequence.
+3. **Navigation.** *Previous Action* / *Next Action* step through the actions of the current moving image; *Run All Actions* runs the remainder in one shot; *Next Moving Image* and *Next Sequence* advance through the row and the table.
+
+**Per-action options that let it run unattended**
+
+- *Auto keypoint detection* — uncheck **Open dialog** to run **headlessly** with chosen detector (AKAZE / KAZE / SIFT / ORB / BRISK), matcher (Brute Force / FLANN) and RANSAC threshold.
+- *Save moving image* / *Save on stack* — check **Save to folder**, pick a folder and (optionally) a suffix; the file is written directly as `<original_stem><suffix><ext>` without a dialog. *Save on stack* treats the row's moving cell as the input multi-frame stack.
+
+**Persistence**
+
+The transform is **kept** across moving images and rows (only an explicit *Reset* action clears it). The whole config — table contents and per-column action sequences with their options — is saved/loaded as JSON via **Save Config** / **Load Config**.
+
+### Progressive Folder Alignment
+*Align a sequence of files with progressive drift or movements.*
+![Progressive Folder Alignement](src/resources/progressive_align_pannel.png)
+*Progressive alignement pannel allow to load moving sequences and define action for alignement allowing to correct cellular movement and drift during for instance long term imaging*
+
+Open via **File → Open Progressive Folder Alignment**. This panel handles the case where each image in a folder needs a **different** transform — typical of acquisition drift across a time series — rather than one shared matrix as in basic Batch Processing.
+
+**Workflow**
+
+1. **Load** one template and a folder (or selection) of moving items, natsorted. Each item may be a flat image **or** a multi-frame ImageJ wavefront stack — stacks are auto-detected and exported through the existing stack pipeline.
+2. **Click any row** in the moving-items list → its representative 2-D frame is sent to the main window, where you align it using any of the usual tools (manual transform, keypoints, cross-correlation, brute force, click+drag).
+3. **Capture as Anchor** stores that image's final matrix as a known-good reference. Mark a few anchors spread across the sequence.
+4. **Build an action sequence** (in the panel) listing the automatic steps you want replayed on every other image — for example `cross_correlation` then `auto_keypoints (headless)`. Same step-builder style as Batch Mode.
+5. **Propagate** runs, for every non-anchor item:
+   - a **prealignment** matrix obtained by linear interpolation between the two nearest anchor matrices by index (nearest-anchor copy outside the anchor range — no extrapolation),
+   - then **replays the action sequence** on top to refine.
+
+   Each result gets a correlation score against the template; anything below the configurable low-correlation threshold is flagged. Double-click a flagged row to fix it manually and re-capture.
+
+6. **Export Aligned + Matrices** writes every warped item (`<name>_aligned.tif`, with stacks producing multi-frame aligned stacks) plus a `matrices.json` listing every per-image transform. **Save Config / Load Config** persists the template, item list, anchors, sequence and mode as JSON for later resumption.
+
+**Reference modes**
+
+A *Reference mode* selector switches between two strategies:
+
+- **Fixed template** *(default)*: every image is aligned to the single loaded template. Use when the template stays visually close to every frame in the sequence.
+- **Sliding (N − X)**: image N aligns to image N−X (its preceding reference). The per-image **relative** transforms are then composed into the first-image coordinate frame (`global[N] = global[N−X] @ rel[N]`) so the whole sequence still ends up in a common output frame. Use when the sequence drifts so much that the last frame looks nothing like the first — alignment stays well-conditioned because each pair of consecutive references is similar. The backward offset **X** is a spinbox (default 1 = previous image).
+
+**Visual tools in the panel**
+
+- Per-item *status* (`pending` / `anchor` / `propagated` / `low`) and correlation score.
+- Thumbnail overlay (template green / aligned red) of the selected item against the global frame.
+- A 2 × 2 plot of *scale*, *rotation*, *tx*, *ty* across the image index, with anchors marked — handy to spot outliers in the propagated transforms.
+- Progress bar (cancelable) during propagation and export.
+
 ### Usage Example
 1. **Load Images:** Click "Load Template" and "Load Moving Image" to select files.
 2. **Adjust View** set your favorite colormaps, and view between "overlay" and "side-by-side".
@@ -238,6 +298,8 @@ For questions, issues, or feature requests, please open an issue or contact the 
 - [x] Add automatic keypoints detection/matching/filtering including editing (CSo)
 - [x] Add a pretransform managing the image centering for transformations (CSo)
 - [x] Add a click+drag translation of moving image. 
+- [x] Add Progressive Folder Alignment panel with fixed-template & sliding (N−X) reference modes (CSo)
+- [x] Add Batch Processing Panel: per-column action sequences, multi-file column fill, headless auto-keypoints, folder save, Run All Actions (CSo)
 - [ ] Add a preference file and option 
 - [ ] Manage appearance depending on screen resolution 
 
