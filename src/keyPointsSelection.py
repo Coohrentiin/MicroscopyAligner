@@ -119,6 +119,55 @@ def estimate_transform_keypoints(point_pairs):
         print(f"Estimating robust affine transform from {n_points} point pairs using RANSAC")
         return ransac_affine_transform(template_pts, moving_pts)
 
+def estimate_constrained_transform(point_pairs, lock_rotation=False, lock_scale=False):
+    """Estimate a transform with rotation and/or scale held fixed.
+
+    Same point-pair convention and matrix direction as
+    :func:`estimate_transform_keypoints` (the returned 3x3 maps a moving point to
+    its template point). The keypoints may only contribute the *unlocked*
+    degrees of freedom:
+
+    - ``lock_rotation and lock_scale`` -> translation only (mean shift).
+    - ``lock_rotation`` only          -> uniform scale + translation (no rotation).
+    - ``lock_scale`` only             -> rotation + translation (rigid Euclidean).
+    - neither                         -> full similarity (same as the default).
+    """
+    if not point_pairs:
+        raise ValueError("At least one point pair is required")
+    # Match estimate_transform_keypoints' (quirky) ordering: index 1 is the
+    # source the matrix maps FROM (moving), index 0 the target (template).
+    src = np.asarray([pair[1] for pair in point_pairs], dtype=float)
+    dst = np.asarray([pair[0] for pair in point_pairs], dtype=float)
+
+    if not lock_rotation and not lock_scale:
+        return estimate_transform_keypoints(point_pairs)
+    if lock_rotation and lock_scale:
+        return translation_transform(src, dst)
+
+    src_c = src.mean(axis=0)
+    dst_c = dst.mean(axis=0)
+    src0 = src - src_c
+    dst0 = dst - dst_c
+
+    if lock_rotation:  # scale + translation, no rotation
+        denom = float(np.sum(src0 * src0))
+        scale = float(np.sum(src0 * dst0) / denom) if denom > 1e-12 else 1.0
+        R = np.eye(2) * scale
+    else:              # lock_scale: rotation + translation, scale fixed to 1
+        H = src0.T @ dst0
+        U, _S, Vt = np.linalg.svd(H)
+        rot = Vt.T @ U.T
+        if np.linalg.det(rot) < 0:        # reflection guard -> proper rotation
+            Vt[-1, :] *= -1
+            rot = Vt.T @ U.T
+        R = rot
+
+    matrix = np.eye(3)
+    matrix[:2, :2] = R
+    matrix[:2, 2] = dst_c - R @ src_c
+    return matrix
+
+
 def translation_transform(template_pts, moving_pts):
     """Estimate translation only from point pairs"""
     # Calculate average translation

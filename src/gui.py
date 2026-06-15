@@ -14,9 +14,10 @@ from PIL import Image
 from autoAlignersGui import BruteForceDialog
 from imageCanva import ImageCanvas
 from transformControls import TransformControls
-from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints
+from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints, estimate_constrained_transform
 from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection, detect_keypoint_pairs
 from utils_images import load_imgfile, load_wavefront_tif, save_stack
+from optics import estimate_scale_translation, estimate_distortion
 
 from skimage.registration import phase_cross_correlation
 import cv2
@@ -34,11 +35,15 @@ class ImageAligner(QMainWindow):
         self.transformed_image = None
         self.current_transform = None
         self.opt_transform = None
+        # Optional non-rigid distortion warp (template->moving) applied on top of
+        # current_transform, e.g. from the keypoint dialog's distortion option.
+        self.distortion_transform = None
         self.optimizer_dialog_open = False
         self.keypoints_dialog = None
         self.auto_keypoints_dialog = None
         self.batch_panel = None
         self.progressive_panel = None
+        self.focusing_panel = None
         self.init_ui()
         self.update_canvas_drag_state()
         
@@ -215,13 +220,16 @@ class ImageAligner(QMainWindow):
         open_progressive_action = QAction("Open Progressive Folder Alignment", self)
         open_progressive_action.triggered.connect(self.open_progressive_folder)
         file_menu.addAction(open_progressive_action)
+        open_focusing_action = QAction("Open Wavefront Focusing && Alignment", self)
+        open_focusing_action.triggered.connect(self.open_focusing_tool)
+        file_menu.addAction(open_focusing_action)
         file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         # Edit menu actions
         reset_transform_action = QAction("Reset Transformation", self)
-        reset_transform_action.triggered.connect(self.transform_controls.reset_transform)
+        reset_transform_action.triggered.connect(self.reset_transformation)
         edit_menu.addAction(reset_transform_action)
         load_export_stack_action = QAction("Apply transform to a ImageJ stack", self)
         load_export_stack_action.triggered.connect(self.load_and_export_stack)
@@ -400,20 +408,29 @@ class ImageAligner(QMainWindow):
             self.canvas.clear_keypoints()
             
             if len(pairs) > 0:
-                matrix = estimate_transform_keypoints(pairs)
+                lock_rotation, lock_scale = self.auto_keypoints_dialog.constraints()
+                matrix = estimate_constrained_transform(
+                    pairs, lock_rotation=lock_rotation, lock_scale=lock_scale)
                 print("Estimated transformation matrix:\n", matrix)
                 self.opt_transform = matrix
                 transform = tf.AffineTransform(matrix=matrix)
-                
+
                 # Combine with current matrix if exists
                 if self.current_transform is not None:
                     matrix = np.dot(transform.params, self.current_transform.params)
                     transform = tf.AffineTransform(matrix=matrix)
-                    
+
                 print(f"Transform matrix:\n{transform.params}")
                 self.onViewModeChanged("overlay")
+                # Optional distortion correction: residual of the incremental
+                # keypoint fit (opt_transform), so it composes with the live
+                # current_transform rather than overriding the scale/rotation.
+                self._apply_keypoint_distortion(pairs, self.opt_transform)
                 self.transform_controls.set_values_from_transform(transform.params)
-                self.statusBar().showMessage(f"Estimated transform from {len(pairs)} detected keypoint pairs.")
+                msg = f"Estimated transform from {len(pairs)} detected keypoint pairs."
+                if self.distortion_transform is not None:
+                    msg += " Distortion correction applied."
+                self.statusBar().showMessage(msg)
             else:
                 self.statusBar().showMessage("No keypoint pairs detected. Operation cancelled.")
         
@@ -425,11 +442,17 @@ class ImageAligner(QMainWindow):
 
     def auto_keypoints_headless(self, detector="AKAZE", matcher="Brute Force",
                                 max_features=500, distance_ratio=0.75,
-                                use_ransac=True, ransac_threshold=5.0):
+                                use_ransac=True, ransac_threshold=5.0,
+                                lock_rotation=False, lock_scale=False,
+                                distortion_model=None):
         """Run automatic keypoint alignment without opening the dialog.
 
         Mirrors the matrix-combination logic of ``open_auto_keypoints_tool`` so
-        batch mode can align headlessly. Returns the number of pairs used.
+        batch mode can align headlessly. ``lock_rotation`` / ``lock_scale``
+        constrain the estimated transform (via
+        :func:`keyPointsSelection.estimate_constrained_transform`); a non-None
+        ``distortion_model`` (tps/poly/radial/piecewise) additionally fits and
+        applies a residual distortion warp. Returns the number of pairs used.
         """
         if self.template_image is None or self.moving_image is None:
             QMessageBox.warning(self, "Warning", "Load both images first")
@@ -449,8 +472,11 @@ class ImageAligner(QMainWindow):
             self.statusBar().showMessage("Auto keypoints: no pairs detected (transform unchanged).")
             return 0
 
-        matrix = estimate_transform_keypoints(pairs)
+        matrix = estimate_constrained_transform(
+            pairs, lock_rotation=lock_rotation, lock_scale=lock_scale)
         self.opt_transform = matrix
+        # Residual distortion (composes with the live linear transform).
+        self._estimate_keypoint_distortion(pairs, self.opt_transform, distortion_model)
         transform = tf.AffineTransform(matrix=matrix)
         if self.current_transform is not None:
             matrix = np.dot(transform.params, self.current_transform.params)
@@ -461,29 +487,141 @@ class ImageAligner(QMainWindow):
             f"Auto keypoints (headless): estimated transform from {len(pairs)} pairs.")
         return len(pairs)
 
+    def auto_keypoints_scale_translation_headless(self, detector="AKAZE",
+                                                  matcher="Brute Force",
+                                                  max_features=500, distance_ratio=0.75,
+                                                  use_ransac=True, ransac_threshold=5.0):
+        """Headless keypoint alignment constrained to scale + translation only.
+
+        Mirrors :meth:`auto_keypoints_headless` but estimates an isotropic
+        scale + translation (no rotation) via
+        :func:`optics.estimate_scale_translation`, used by the Focusing tool
+        where the two objectives share orientation. Returns the pairs used.
+        """
+        if self.template_image is None or self.moving_image is None:
+            QMessageBox.warning(self, "Warning", "Load both images first")
+            return 0
+
+        moving_img_for_detection = (
+            self.transformed_image if self.transformed_image is not None
+            else self.moving_image
+        )
+        pairs = detect_keypoint_pairs(
+            self.template_image, moving_img_for_detection,
+            detector=detector, matcher=matcher, max_features=max_features,
+            distance_ratio=distance_ratio, use_ransac=use_ransac,
+            ransac_threshold=ransac_threshold,
+        )
+        if len(pairs) == 0:
+            self.statusBar().showMessage("Auto keypoints: no pairs detected (transform unchanged).")
+            return 0
+
+        matrix = estimate_scale_translation(pairs)
+        self.opt_transform = matrix
+        transform = tf.AffineTransform(matrix=matrix)
+        if self.current_transform is not None:
+            matrix = np.dot(transform.params, self.current_transform.params)
+            transform = tf.AffineTransform(matrix=matrix)
+        self.onViewModeChanged("overlay")
+        self.transform_controls.set_values_from_transform(transform.params)
+        self.statusBar().showMessage(
+            f"Auto keypoints scale+translation (headless): from {len(pairs)} pairs.")
+        return len(pairs)
+
     def apply_transform(self, params):
         """Apply transformation to moving image"""
         if self.moving_image is None:
             return
-            
+
         # # Build transformation matrix
-        transform = tf.SimilarityTransform(scale=params['scale'], 
+        transform = tf.SimilarityTransform(scale=params['scale'],
                                            rotation=np.radians(params['rotation']),
                                            translation=[params['tx'], params['ty']])
 
         self.current_transform = transform
-        
+
         print(f"Transform matrix (apply_transform):\n{transform.params}")
-        # Apply transformation
-        self.transformed_image = tf.warp(
+        # Apply transformation (+ optional distortion warp on top)
+        self.transformed_image = self._warp_with_distortion(
             self.moving_image,
-            transform.inverse,
-            output_shape=self.template_image.shape if self.template_image is not None else self.moving_image.shape,
-            preserve_range=True
-        ).astype(np.float32)
-        
+            self.template_image.shape if self.template_image is not None else self.moving_image.shape,
+        )
+
         self.update_display()
-        
+
+    def _warp_with_distortion(self, image, output_shape, transform=None):
+        """Warp ``image`` into the template frame, honouring ``distortion_transform``.
+
+        ``current_transform`` maps moving->template; its ``.inverse`` is the
+        usual ``tf.warp`` inverse_map (output/template coords -> moving coords).
+        ``distortion_transform`` is a **residual** template->template remap (the
+        non-rigid part after the linear fit), so the two **compose**:
+        ``inverse_map(coords) = current_transform.inverse(distortion(coords))``.
+        This keeps the linear transform live -- editing scale / rotation / tx /
+        ty in the controls still re-warps correctly while the distortion rides on
+        top. Used by display and every export path.
+        """
+        transform = transform if transform is not None else self.current_transform
+        if transform is None:
+            return None
+        distortion = self.distortion_transform
+        if distortion is None:
+            inverse_map = transform.inverse
+        else:
+            def inverse_map(coords):
+                return transform.inverse(distortion(coords))
+        return tf.warp(
+            image, inverse_map, output_shape=output_shape, preserve_range=True
+        ).astype(np.float32)
+
+    def _apply_keypoint_distortion(self, pairs, linear_matrix):
+        """Estimate a distortion warp from keypoint pairs if the dialog asked.
+
+        Fits the **residual** non-rigid remap left over after the linear keypoint
+        fit ``linear_matrix`` (the incremental moving->template estimate from
+        these pairs) via :func:`optics.estimate_distortion`, and stores it as
+        ``distortion_transform``. Because it is a residual, it **composes** with
+        the live ``current_transform`` in :meth:`_warp_with_distortion` (so the
+        scale / rotation / tx / ty in the controls remain effective). Cleared on
+        failure / when not requested.
+        """
+        dialog = self.auto_keypoints_dialog
+        if dialog is None or not hasattr(dialog, "distortion_request"):
+            self.distortion_transform = None
+            return
+        enabled, model = dialog.distortion_request()
+        self._estimate_keypoint_distortion(pairs, linear_matrix,
+                                           model if enabled else None, warn=True)
+
+    def _estimate_keypoint_distortion(self, pairs, linear_matrix, model, warn=False):
+        """Set ``distortion_transform`` to the residual warp for ``model`` (or None).
+
+        Shared by the dialog path and the headless/batch path. ``model`` None
+        clears it; <3 pairs skips (warning optional). The residual composes with
+        the live linear transform in :meth:`_warp_with_distortion`.
+        """
+        self.distortion_transform = None
+        if not model:
+            return
+        if len(pairs) < 3:
+            if warn:
+                QMessageBox.warning(self, "Distortion",
+                                    f"Need >= 3 pairs for distortion ({len(pairs)} found); skipped.")
+            return
+        shape = self.template_image.shape if self.template_image is not None else self.moving_image.shape
+        try:
+            self.distortion_transform = estimate_distortion(
+                pairs, shape, model=model, residual_matrix=linear_matrix)
+        except Exception as e:
+            if warn:
+                QMessageBox.warning(self, "Distortion", f"Distortion estimate failed: {e}")
+            self.distortion_transform = None
+
+    def reset_transformation(self):
+        """Reset both the linear transform and any distortion warp."""
+        self.distortion_transform = None
+        self.transform_controls.reset_transform()  # emits transform_changed -> apply_transform
+
     def update_display(self):
         """Update image display with current settings"""
         if self.template_image is not None:
@@ -796,12 +934,10 @@ class ImageAligner(QMainWindow):
         """Re-warp the moving image at full resolution for export, or None."""
         if self.current_transform is None or self.moving_image is None:
             return None
-        return tf.warp(
+        return self._warp_with_distortion(
             self.moving_image,
-            self.current_transform.inverse,
-            output_shape=self.template_image.shape if self.template_image is not None else self.moving_image.shape,
-            preserve_range=True
-        ).astype(np.float32)
+            self.template_image.shape if self.template_image is not None else self.moving_image.shape,
+        )
 
     def save_image_to_folder(self, folder, suffix=""):
         """Save the transformed moving image to ``folder`` keeping its original
@@ -896,14 +1032,8 @@ class ImageAligner(QMainWindow):
                 return
 
             output_shape = ref_shape if ref_shape is not None else phase.shape
-            phase_t = tf.warp(
-                phase, self.current_transform.inverse,
-                output_shape=output_shape, preserve_range=True,
-            ).astype(np.float32)
-            amp_t = tf.warp(
-                amp, self.current_transform.inverse,
-                output_shape=output_shape, preserve_range=True,
-            ).astype(np.float32)
+            phase_t = self._warp_with_distortion(phase, output_shape)
+            amp_t = self._warp_with_distortion(amp, output_shape)
 
             # Channel order matches load_wavefront_tif: 0=phase, 1=amplitude
             frames.append(np.stack([phase_t, amp_t], axis=-1))
@@ -1000,4 +1130,13 @@ class ImageAligner(QMainWindow):
         self.progressive_panel.show()
         self.progressive_panel.raise_()
         self.progressive_panel.activateWindow()
+
+    def open_focusing_tool(self):
+        """Open the Wavefront Focusing & Alignment panel that drives this window."""
+        from focusingTool import FocusingPanel
+        if self.focusing_panel is None:
+            self.focusing_panel = FocusingPanel(self)
+        self.focusing_panel.show()
+        self.focusing_panel.raise_()
+        self.focusing_panel.activateWindow()
   

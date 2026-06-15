@@ -1,7 +1,7 @@
 # MicroscopyAligner
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
-![Version](https://img.shields.io/badge/version-1.1-blue)
+![Version](https://img.shields.io/badge/version-1.3-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 <p align="center">

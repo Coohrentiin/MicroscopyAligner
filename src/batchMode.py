@@ -56,8 +56,16 @@ def _action_summary(action):
     if t == "auto_keypoints":
         if action.get("dialog", True):
             return "Auto keypoint detection (dialog)"
+        extra = []
+        if action.get("lock_rotation"):
+            extra.append("lock rot")
+        if action.get("lock_scale"):
+            extra.append("lock scale")
+        if action.get("distortion_model"):
+            extra.append(f"distortion {action['distortion_model']}")
+        extra_txt = (", " + ", ".join(extra)) if extra else ""
         return (f"Auto keypoint detection (headless: {action.get('detector', 'AKAZE')} / "
-                f"{action.get('matcher', 'Brute Force')}, RANSAC={action.get('ransac_threshold', 5.0):g})")
+                f"{action.get('matcher', 'Brute Force')}, RANSAC={action.get('ransac_threshold', 5.0):g}{extra_txt})")
     if t in ("save_image", "save_stack"):
         label = ACTION_LABELS.get(t, t)
         folder = action.get("folder")
@@ -209,7 +217,15 @@ class BatchModePanel(QWidget):
         self.ak_detector = QComboBox(); self.ak_detector.addItems(["AKAZE", "KAZE", "SIFT", "ORB", "BRISK"])
         self.ak_matcher = QComboBox(); self.ak_matcher.addItems(["Brute Force", "FLANN"])
         self.ak_ransac = QDoubleSpinBox(); self.ak_ransac.setRange(0.5, 20.0); self.ak_ransac.setValue(5.0); self.ak_ransac.setPrefix("RANSAC ")
-        self.ak_headless_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac]
+        # Constraints (lock rotation / scale) + optional residual distortion.
+        self.ak_lock_rotation = QCheckBox("Lock rotation")
+        self.ak_lock_scale = QCheckBox("Lock scale")
+        self.ak_use_distortion = QCheckBox("Distortion")
+        self.ak_use_distortion.toggled.connect(self._update_option_visibility)
+        self.ak_distortion_model = QComboBox(); self.ak_distortion_model.addItems(["tps", "poly", "radial", "piecewise"])
+        self.ak_headless_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac,
+                                    self.ak_lock_rotation, self.ak_lock_scale,
+                                    self.ak_use_distortion, self.ak_distortion_model]
         for w in self.ak_headless_widgets:
             self.auto_row.addWidget(w)
         self.auto_row.addStretch()
@@ -420,6 +436,8 @@ class BatchModePanel(QWidget):
             headless = not self.ak_use_dialog.isChecked()
             for w in self.ak_headless_widgets:
                 w.setVisible(headless)
+            # The distortion model combo only matters when distortion is on.
+            self.ak_distortion_model.setVisible(headless and self.ak_use_distortion.isChecked())
         # Folder/suffix only relevant when 'Save to folder' is on.
         if atype in ("save_image", "save_stack"):
             use_folder = self.save_use_folder.isChecked()
@@ -458,6 +476,10 @@ class BatchModePanel(QWidget):
                     "detector": self.ak_detector.currentText(),
                     "matcher": self.ak_matcher.currentText(),
                     "ransac_threshold": self.ak_ransac.value(),
+                    "lock_rotation": self.ak_lock_rotation.isChecked(),
+                    "lock_scale": self.ak_lock_scale.isChecked(),
+                    "distortion_model": (self.ak_distortion_model.currentText()
+                                         if self.ak_use_distortion.isChecked() else None),
                 })
         elif atype in ("save_image", "save_stack"):
             action = {"type": atype}
@@ -553,6 +575,9 @@ class BatchModePanel(QWidget):
                     distance_ratio=action.get("distance_ratio", 0.75),
                     use_ransac=action.get("use_ransac", True),
                     ransac_threshold=action.get("ransac_threshold", 5.0),
+                    lock_rotation=action.get("lock_rotation", False),
+                    lock_scale=action.get("lock_scale", False),
+                    distortion_model=action.get("distortion_model"),
                 )
         elif t == "cross_correlation":
             a.optimize_phase_correlation()

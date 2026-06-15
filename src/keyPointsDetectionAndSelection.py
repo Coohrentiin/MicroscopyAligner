@@ -208,7 +208,42 @@ class KeyPointsDetectionAndSelection(QDialog):
         ransac_layout.addLayout(threshold_layout)
         
         ransac_group.setLayout(ransac_layout)
-        
+
+        # Transform constraints: optionally forbid the keypoints from changing
+        # rotation and/or scale (e.g. objectives share orientation / known mag).
+        constrain_group = QGroupBox("Transform Constraints")
+        constrain_layout = QVBoxLayout()
+        self.lock_rotation = QCheckBox("Lock rotation (no rotation from keypoints)")
+        self.lock_scale = QCheckBox("Lock scale (no scale change from keypoints)")
+        constrain_layout.addWidget(self.lock_rotation)
+        constrain_layout.addWidget(self.lock_scale)
+        chint = QLabel("Locking both leaves translation only; locking rotation "
+                       "leaves scale+translation; locking scale leaves rotation+translation.")
+        chint.setStyleSheet("color: gray;"); chint.setWordWrap(True)
+        constrain_layout.addWidget(chint)
+        constrain_group.setLayout(constrain_layout)
+
+        # Distortion correction (non-rigid warp from the matched pairs, on top of
+        # the linear transform -- e.g. to correct a non-centered objective bend).
+        distortion_group = QGroupBox("Distortion Correction")
+        distortion_layout = QVBoxLayout()
+        self.use_distortion = QCheckBox("Estimate & apply distortion warp")
+        self.use_distortion.setChecked(False)
+        self.use_distortion.toggled.connect(self._update_distortion_enabled)
+        distortion_layout.addWidget(self.use_distortion)
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model:"))
+        self.distortion_model = QComboBox()
+        self.distortion_model.addItems(["tps", "poly", "radial", "piecewise"])
+        self.distortion_model.setEnabled(False)
+        model_layout.addWidget(self.distortion_model)
+        distortion_layout.addLayout(model_layout)
+        hint = QLabel("Needs >= 3 pairs (TPS/piecewise want more, well spread). "
+                      "Applied after the linear fit; persists until 'Reset Transformation'.")
+        hint.setStyleSheet("color: gray;"); hint.setWordWrap(True)
+        distortion_layout.addWidget(hint)
+        distortion_group.setLayout(distortion_layout)
+
         # Detect button
         self.detect_btn = QPushButton("Detect & Match Keypoints")
         self.detect_btn.setStyleSheet("QPushButton { background-color: #2196F3; font-weight: bold; }")
@@ -234,6 +269,8 @@ class KeyPointsDetectionAndSelection(QDialog):
         layout.addWidget(detection_group)
         layout.addWidget(matching_group)
         layout.addWidget(ransac_group)
+        layout.addWidget(constrain_group)
+        layout.addWidget(distortion_group)
         layout.addWidget(self.detect_btn)
         layout.addWidget(list_label)
         layout.addWidget(self.points_list)
@@ -245,6 +282,17 @@ class KeyPointsDetectionAndSelection(QDialog):
         self.remove_btn.clicked.connect(self.remove_point)
         self.clear_btn.clicked.connect(self.clear_all)
         self.done_btn.clicked.connect(self.accept)
+
+    def _update_distortion_enabled(self, checked):
+        self.distortion_model.setEnabled(checked)
+
+    def distortion_request(self):
+        """Return ``(enabled, model)`` for the distortion-correction step."""
+        return self.use_distortion.isChecked(), self.distortion_model.currentText()
+
+    def constraints(self):
+        """Return ``(lock_rotation, lock_scale)`` for the estimated transform."""
+        return self.lock_rotation.isChecked(), self.lock_scale.isChecked()
 
     def detect_and_match(self):
         """Detect keypoints, match them, and optionally filter with RANSAC."""
