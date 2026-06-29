@@ -95,8 +95,12 @@ def filter_with_ransac(template_pts, moving_pts, threshold):
 def detect_keypoint_pairs(template_image, moving_image, detector="AKAZE",
                           matcher="Brute Force", max_features=500,
                           distance_ratio=0.75, use_ransac=True,
-                          ransac_threshold=5.0):
+                          ransac_threshold=5.0, border_crop=0):
     """Run the full detect -> match -> (RANSAC) pipeline headlessly.
+
+    ``border_crop`` (px) drops matched pairs whose template OR moving point lies
+    within that margin of the respective image edge, avoiding spurious matches
+    from edge/border artifacts (e.g. a propagated/zero-padded frame).
 
     Returns a list of ``(template_point, moving_point)`` tuples (possibly empty).
     """
@@ -111,6 +115,21 @@ def detect_keypoint_pairs(template_image, moving_image, detector="AKAZE",
 
     template_pts = np.float32([kp_t[m.queryIdx].pt for m in matches])
     moving_pts = np.float32([kp_m[m.trainIdx].pt for m in matches])
+
+    if border_crop and border_crop > 0:
+        th, tw = template_image.shape[:2]
+        mh, mw = moving_image.shape[:2]
+        b = float(border_crop)
+        keep = []
+        for i in range(len(template_pts)):
+            tx, ty = template_pts[i]; mx, my = moving_pts[i]
+            if (b <= tx <= tw - b and b <= ty <= th - b and
+                    b <= mx <= mw - b and b <= my <= mh - b):
+                keep.append(i)
+        if not keep:
+            return []
+        template_pts = template_pts[keep]; moving_pts = moving_pts[keep]
+
     if use_ransac:
         template_pts, moving_pts = filter_with_ransac(
             template_pts, moving_pts, ransac_threshold)
@@ -206,7 +225,18 @@ class KeyPointsDetectionAndSelection(QDialog):
         self.ransac_threshold.setDecimals(1)
         threshold_layout.addWidget(self.ransac_threshold)
         ransac_layout.addLayout(threshold_layout)
-        
+
+        # Border crop: drop matched pairs within N px of an image edge, to avoid
+        # border / FFT-padding artifacts being matched as keypoints.
+        border_layout = QHBoxLayout()
+        border_layout.addWidget(QLabel("Crop template borders (px):"))
+        self.border_crop = QSpinBox()
+        self.border_crop.setRange(0, 1000)
+        self.border_crop.setValue(0)
+        self.border_crop.setToolTip("Ignore keypoints within this margin of the image edges.")
+        border_layout.addWidget(self.border_crop)
+        ransac_layout.addLayout(border_layout)
+
         ransac_group.setLayout(ransac_layout)
 
         # Transform constraints: optionally forbid the keypoints from changing
@@ -234,7 +264,7 @@ class KeyPointsDetectionAndSelection(QDialog):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("Model:"))
         self.distortion_model = QComboBox()
-        self.distortion_model.addItems(["tps", "poly", "radial", "piecewise"])
+        self.distortion_model.addItems(["tps", "poly", "radial", "spherical", "piecewise"])
         self.distortion_model.setEnabled(False)
         model_layout.addWidget(self.distortion_model)
         distortion_layout.addLayout(model_layout)
@@ -294,6 +324,10 @@ class KeyPointsDetectionAndSelection(QDialog):
         """Return ``(lock_rotation, lock_scale)`` for the estimated transform."""
         return self.lock_rotation.isChecked(), self.lock_scale.isChecked()
 
+    def border_crop_px(self):
+        """Border margin (px) to ignore keypoints near image edges."""
+        return int(self.border_crop.value())
+
     def detect_and_match(self):
         """Detect keypoints, match them, and optionally filter with RANSAC."""
         if self.template_image is None or self.moving_image is None:
@@ -333,7 +367,21 @@ class KeyPointsDetectionAndSelection(QDialog):
             # Step 3: Extract matched points
             template_pts = np.float32([self.keypoints_template[m.queryIdx].pt for m in matches])
             moving_pts = np.float32([self.keypoints_moving[m.trainIdx].pt for m in matches])
-            
+
+            # Step 3b: Drop pairs near the image borders (avoid edge artifacts).
+            b = self.border_crop_px()
+            if b > 0:
+                th, tw = self.template_image.shape[:2]
+                mh, mw = self.moving_image.shape[:2]
+                keep = [i for i in range(len(template_pts))
+                        if (b <= template_pts[i][0] <= tw - b and b <= template_pts[i][1] <= th - b
+                            and b <= moving_pts[i][0] <= mw - b and b <= moving_pts[i][1] <= mh - b)]
+                template_pts = template_pts[keep]; moving_pts = moving_pts[keep]
+                if len(template_pts) == 0:
+                    QMessageBox.warning(self, "Warning", "No keypoints left after border crop")
+                    QApplication.restoreOverrideCursor()
+                    return
+
             # Step 4: Apply RANSAC filtering if enabled
             if self.use_ransac.isChecked():
                 template_pts, moving_pts = self.filter_with_ransac(

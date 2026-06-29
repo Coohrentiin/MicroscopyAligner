@@ -6,3 +6,8 @@ build/
 #all pycache files and folders
 **/__pycache__/
 **/*.pyc
+
+### Created by Python
+__pycache__/
+.idea/
+.*

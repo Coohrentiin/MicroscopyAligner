@@ -57,6 +57,9 @@ WF_FILTER = "Wavefront TIFF (*.tif *.tiff);;All Files (*)"
 
 ALIGN_CMAP = "turbo"  # high-contrast default for the alignment overlay
 
+# User-editable default action sequence (overrides the built-in when present).
+DEFAULT_SEQUENCE_PATH = Path.home() / ".manual_registration_app" / "focusing_default_sequence.json"
+
 # Phase-offset bar range: +/- PHASE_OFFSET_MAX radians over PHASE_OFFSET_STEPS ticks.
 PHASE_OFFSET_MAX = 2.0 * np.pi
 PHASE_OFFSET_STEPS = 360
@@ -110,8 +113,9 @@ def _action_summary(action):
     if t == "ncc_refine":
         return "Subpixel NCC refinement"
     if t == "focus_check":
-        return (f"Focus check (+/-{action.get('half_range_um', 5):g}um step {action.get('step_nm', 100):g}nm, "
-                f"{action.get('metric', 'ncc')})")
+        return (f"Focus check (tpl ±{action.get('half_tpl_um', 5):g}/{action.get('step_tpl_nm', 100):g}nm, "
+                f"mov ±{action.get('half_mov_um', 5):g}/{action.get('step_mov_nm', 100):g}nm, "
+                f"{action.get('metric', 'ncc')}, ROI {action.get('roi_frac', 0.5) * 100:g}%)")
     if t == "save":
         what = action.get("what", "moving")
         chan = "all channels" if action.get("all_channels", True) else f"channel {action.get('channel', 0)}"
@@ -161,6 +165,8 @@ class FocusingPanel(QWidget):
         self._refocus_target = "moving"
         self._live_feedback = False   # toggled by live_feedback actions
         self._step_index = 0          # next action to run in step-by-step mode
+        self._focus_map_window = None  # shared 2-D focus-map window (focus_check)
+        self._blocking_run = False     # True during Run All: pause on map/distortion popups
 
         self._init_ui()
         self._refresh_table()
@@ -246,8 +252,9 @@ class FocusingPanel(QWidget):
     def _build_table_section(self):
         box = QGroupBox("2. Samples  (click a row to load it)")
         v = QVBoxLayout(box)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Template", "Moving", "Status", "z tpl(um)", "z mov(um)", "Corr"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Template", "Moving", "Status", "z tpl(um)", "z mov(um)", "Corr", "Sec."])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -268,8 +275,22 @@ class FocusingPanel(QWidget):
             btns.addWidget(b)
         v.addLayout(btns)
 
+        sec = QHBoxLayout()
+        sec_mov = QPushButton("Secondary Moving(s)...")
+        sec_mov.clicked.connect(lambda: self._browse_secondary("moving"))
+        sec_tpl = QPushButton("Secondary Template(s)...")
+        sec_tpl.clicked.connect(lambda: self._browse_secondary("template"))
+        sec_clear = QPushButton("Clear Secondaries")
+        sec_clear.clicked.connect(self._clear_secondaries)
+        for b in (sec_mov, sec_tpl, sec_clear):
+            sec.addWidget(b)
+        sec.addStretch()
+        v.addLayout(sec)
+
         hint = QLabel("Browse fills the column downward from the selected row (natsorted, adding rows). "
-                      "Click a row to make it the working sample for refocus / actions.")
+                      "Click a row to make it the working sample for refocus / actions. "
+                      "Secondary images are NOT displayed; at save they get the same transform "
+                      "(moving: propagation+matrix+distortion; template: propagation) as the primary.")
         hint.setStyleSheet("color: gray;"); hint.setWordWrap(True)
         v.addWidget(hint)
         return box
@@ -369,17 +390,26 @@ class FocusingPanel(QWidget):
         self.ak_detector = QComboBox(); self.ak_detector.addItems(["AKAZE", "KAZE", "SIFT", "ORB", "BRISK"])
         self.ak_matcher = QComboBox(); self.ak_matcher.addItems(["Brute Force", "FLANN"])
         self.ak_ransac = self._spin(0.5, 20.0, 5.0, " RANSAC", step=0.5)
-        self.kp_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac]
+        self.ak_border = QSpinBox(); self.ak_border.setRange(0, 1000); self.ak_border.setValue(0)
+        self.ak_border.setPrefix("border "); self.ak_border.setSuffix("px")
+        self.ak_border.setToolTip("Crop template/moving borders: ignore keypoints within this margin (#2).")
+        self.kp_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac, self.ak_border]
         for w in self.kp_widgets:
             ctrl.addWidget(w)
-        self.dist_model = QComboBox(); self.dist_model.addItems(["tps", "poly", "radial", "piecewise"])
+        self.dist_model = QComboBox(); self.dist_model.addItems(["tps", "poly", "radial", "spherical", "piecewise"])
         ctrl.addWidget(self.dist_model)
 
-        # focus_check options
-        self.fc_half = self._spin(0.1, 200, 5.0, " +/-um")
-        self.fc_step = self._spin(10, 5000, 100.0, " nm step")
+        # focus_check options (separate template / moving ranges)
+        self.fc_half_tpl = self._spin(0.1, 200, 5.0, " ±tplum")
+        self.fc_step_tpl = self._spin(10, 5000, 100.0, " tpl nm")
+        self.fc_half_mov = self._spin(0.1, 200, 5.0, " ±movum")
+        self.fc_step_mov = self._spin(10, 5000, 100.0, " mov nm")
         self.fc_metric = QComboBox(); self.fc_metric.addItems(["ncc", "l2", "ssim"])
-        self.fc_widgets = [self.fc_half, self.fc_step, self.fc_metric]
+        self.fc_roi_pct = QSpinBox(); self.fc_roi_pct.setRange(5, 100); self.fc_roi_pct.setValue(25)
+        self.fc_roi_pct.setPrefix("ROI "); self.fc_roi_pct.setSuffix("%")
+        self.fc_roi_pct.setToolTip("Centered crop used for the focus map; z is applied full-frame.")
+        self.fc_widgets = [self.fc_half_tpl, self.fc_step_tpl,
+                           self.fc_half_mov, self.fc_step_mov, self.fc_metric, self.fc_roi_pct]
         for w in self.fc_widgets:
             ctrl.addWidget(w)
 
@@ -419,6 +449,16 @@ class FocusingPanel(QWidget):
         for b in (rem_act, up, down, step, reset_steps, run_all, run_rows):
             edit_row.addWidget(b)
         edit_row.addStretch()
+        default_seq = QPushButton("Load Default Sequence")
+        default_seq.setStyleSheet("QPushButton { background-color: #4CAF50; }")
+        default_seq.clicked.connect(self._load_default_sequence)
+        edit_row.addWidget(default_seq)
+        save_def = QPushButton("Save as Default"); save_def.clicked.connect(self._save_as_default_sequence)
+        save_def.setToolTip("Persist the current (edited) action list as the default sequence.")
+        edit_row.addWidget(save_def)
+        reset_def = QPushButton("Reset Default"); reset_def.clicked.connect(self._reset_default_sequence)
+        reset_def.setToolTip("Forget the user default; 'Load Default' reverts to the built-in.")
+        edit_row.addWidget(reset_def)
         save_cfg = QPushButton("Save Config"); save_cfg.clicked.connect(self._save_config)
         load_cfg = QPushButton("Load Config"); load_cfg.clicked.connect(self._load_config)
         edit_row.addWidget(save_cfg); edit_row.addWidget(load_cfg)
@@ -543,6 +583,32 @@ class FocusingPanel(QWidget):
                 self.rows[r]["wl_mov"] = wl; self.rows[r]["moving_frame"] = 0
         self._refresh_table()
 
+    def _browse_secondary(self, which):
+        """Attach secondary image(s); multi-select natsort-fills DOWN across rows
+        (one per row, adding rows as needed), like 'Browse Movings...' (#3)."""
+        paths, _ = QFileDialog.getOpenFileNames(self, f"Select secondary {which} WF files", "", WF_FILTER)
+        if not paths:
+            return
+        paths = natsorted(paths)
+        key = "secondary_moving_paths" if which == "moving" else "secondary_template_paths"
+        start = max(0, self.table.currentRow())
+        for i, path in enumerate(paths):
+            r = start + i
+            if r >= len(self.rows):
+                self._add_row(refresh=False)
+            self.rows[r].setdefault(key, [])
+            self.rows[r][key].append(path)
+        self._refresh_table()
+        self.status_label.setText(
+            f"Added {len(paths)} secondary {which} image(s) down from row {start + 1}.")
+
+    def _clear_secondaries(self):
+        row = self.table.currentRow()
+        if 0 <= row < len(self.rows):
+            self.rows[row]["secondary_moving_paths"] = []
+            self.rows[row]["secondary_template_paths"] = []
+            self._refresh_table()
+
     def _new_row(self):
         return {
             "template_path": "", "moving_path": "",
@@ -551,6 +617,10 @@ class FocusingPanel(QWidget):
             "template_frame": 0, "moving_frame": 0,
             "optics": None, "z_tpl_um": 0.0, "z_mov_um": 0.0,
             "global_matrix": None, "distortion": None,
+            # Secondary images (#1): never displayed; at save each undergoes the
+            # SAME transform as its primary (moving: z+matrix+distortion;
+            # template: z only).
+            "secondary_moving_paths": [], "secondary_template_paths": [],
             "status": self.STATUS_PENDING, "corr": None,
         }
 
@@ -578,10 +648,14 @@ class FocusingPanel(QWidget):
             mov = Path(item["moving_path"]).name if item["moving_path"] else ""
             if item["n_frames_mov"] > 1:
                 mov += f"  [×{item['n_frames_mov']}]"
+            n_sec_m = len(item.get("secondary_moving_paths", []))
+            n_sec_t = len(item.get("secondary_template_paths", []))
+            sec_txt = "" if (n_sec_m + n_sec_t) == 0 else f"m{n_sec_m}/t{n_sec_t}"
             cells = [
                 tpl, mov, item["status"],
                 f"{item['z_tpl_um']:.3f}", f"{item['z_mov_um']:.3f}",
                 "" if item["corr"] is None else f"{item['corr']:.3f}",
+                sec_txt,
             ]
             for c, text in enumerate(cells):
                 cell = QTableWidgetItem(text)
@@ -589,6 +663,9 @@ class FocusingPanel(QWidget):
                     cell.setToolTip(item["template_path"])
                 if c == 1 and item["moving_path"]:
                     cell.setToolTip(item["moving_path"])
+                if c == 6 and (n_sec_m or n_sec_t):
+                    cell.setToolTip("Secondary moving:\n" + "\n".join(item.get("secondary_moving_paths", []))
+                                    + "\nSecondary template:\n" + "\n".join(item.get("secondary_template_paths", [])))
                 self.table.setItem(r, c, cell)
         self.table.blockSignals(False)
 
@@ -689,6 +766,19 @@ class FocusingPanel(QWidget):
             im = tf.rescale(field.imag, scale, order=1, preserve_range=True)
             field = re + 1j * im
         return field
+
+    @staticmethod
+    def _fit_offset(field_shape, shape):
+        """``(x0, y0)`` centered-crop offset :meth:`_fit_to_template` applies.
+
+        A moving pixel ``(x, y)`` in the cropped (template-shaped) frame is
+        ``(x + x0, y + y0)`` in the full ``field``. Used at save to warp the
+        UN-cropped moving with the matrix that was estimated on the crop, so the
+        output borders fill from the larger FOV instead of going black (#2).
+        """
+        h, w = field_shape[:2]
+        H, W = shape
+        return (max(0, (w - W) // 2), max(0, (h - H) // 2))
 
     @staticmethod
     def _fit_to_template(field, shape):
@@ -792,6 +882,14 @@ class FocusingPanel(QWidget):
     def _subtract_median(self):
         """Whether unwrapped phase should have its median removed."""
         return self.phase_median_check.isChecked()
+
+    def _field_to_observable(self, field):
+        """2-D real view of a complex field per the panel's observable combo
+        (amplitude or unwrapped phase). Used for the main-window live preview so
+        the user can switch the channel they inspect (#2)."""
+        if self.observable_combo.currentText() == "phase":
+            return opt.unwrapped_phase(field, subtract_median=self._subtract_median())
+        return np.abs(field).astype(np.float32)
 
     def _displayed_phase(self, field):
         """Phase for display with FIXED colour limits so offset/median are visible.
@@ -960,12 +1058,15 @@ class FocusingPanel(QWidget):
         elif atype in ("keypoints_scale_translation", "distortion_correct"):
             action = {"type": atype, "detector": self.ak_detector.currentText(),
                       "matcher": self.ak_matcher.currentText(),
-                      "ransac_threshold": self.ak_ransac.value()}
+                      "ransac_threshold": self.ak_ransac.value(),
+                      "border_crop": self.ak_border.value()}
             if atype == "distortion_correct":
                 action["model"] = self.dist_model.currentText()
         elif atype == "focus_check":
-            action = {"type": atype, "half_range_um": self.fc_half.value(),
-                      "step_nm": self.fc_step.value(), "metric": self.fc_metric.currentText()}
+            action = {"type": atype, "metric": self.fc_metric.currentText(),
+                      "half_tpl_um": self.fc_half_tpl.value(), "step_tpl_nm": self.fc_step_tpl.value(),
+                      "half_mov_um": self.fc_half_mov.value(), "step_mov_nm": self.fc_step_mov.value(),
+                      "roi_frac": self.fc_roi_pct.value() / 100.0}
             if self._roi is not None:
                 action["roi"] = list(self._roi)
         elif atype == "live_feedback":
@@ -1003,6 +1104,73 @@ class FocusingPanel(QWidget):
         for a in self.actions:
             self.action_list.addItem(_action_summary(a))
 
+    @staticmethod
+    def _builtin_default_sequence():
+        """The built-in standard focus+align pipeline (used when no user default
+        file exists / on reset). Edit + 'Save as Default' overrides this."""
+        kp = lambda: {"type": "keypoints_scale_translation", "detector": "AKAZE",
+                      "matcher": "Brute Force", "ransac_threshold": 5.0, "border_crop": 0}
+        return [
+            {"type": "set_optics", **DEFAULT_OPTICS},
+            kp(),                              # round 1 (rotation blocked)
+            kp(),                              # round 2 (rotation blocked)
+            {"type": "refocus", "target": "template", "mode": "manual", "z_um": 0.0},
+            {"type": "refocus", "target": "moving", "mode": "manual", "z_um": 0.0},
+            kp(),                              # rotation-blocked keypoints
+            {"type": "focus_check", "metric": "ncc", "roi_frac": 0.5,  # central ROI
+             "half_tpl_um": 2.0, "step_tpl_nm": 200.0,    # 20x template
+             "half_mov_um": 20.0, "step_mov_nm": 1000.0},  # 10x moving
+            kp(),                              # rotation-blocked keypoints
+            {"type": "save", "what": "both", "all_channels": True,
+             "channel": 0, "suffix": "_aligned"},  # folder prompted at save
+        ]
+
+    def _load_default_sequence(self):
+        """Load the default focus+align pipeline -- the user's saved default
+        (``DEFAULT_SEQUENCE_PATH``) if present, else the built-in (#1)."""
+        actions = None
+        src = "built-in"
+        if DEFAULT_SEQUENCE_PATH.exists():
+            try:
+                actions = json.loads(DEFAULT_SEQUENCE_PATH.read_text())
+                assert isinstance(actions, list)
+                src = "user default"
+            except Exception:
+                actions = None
+        if actions is None:
+            actions = self._builtin_default_sequence()
+        self.actions = [dict(a) for a in actions]
+        self._refresh_action_list()
+        self._step_index = 0
+        self.observable_combo.setCurrentText("phase")  # refocus is on phase
+        self.status_label.setText(
+            f"Loaded default sequence ({len(self.actions)} actions, {src}). Edit it and "
+            "'Save as Default' to persist; step through it and use the 2-D map's 'Use optimal'.")
+
+    def _save_as_default_sequence(self):
+        """Persist the CURRENT action list as the user default (#1)."""
+        if not self.actions:
+            QMessageBox.information(self, "Default Sequence", "No actions to save as default.")
+            return
+        try:
+            DEFAULT_SEQUENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DEFAULT_SEQUENCE_PATH.write_text(json.dumps(self.actions, indent=2))
+        except Exception as e:
+            QMessageBox.critical(self, "Default Sequence", f"Failed to save default: {e}")
+            return
+        self.status_label.setText(
+            f"Saved current {len(self.actions)} action(s) as the default sequence.")
+
+    def _reset_default_sequence(self):
+        """Delete the user default so 'Load Default' uses the built-in again."""
+        try:
+            if DEFAULT_SEQUENCE_PATH.exists():
+                DEFAULT_SEQUENCE_PATH.unlink()
+        except Exception as e:
+            QMessageBox.critical(self, "Default Sequence", f"Failed to reset: {e}")
+            return
+        self.status_label.setText("Reset to the built-in default sequence.")
+
     # --------------------------------------------------------- action execute
     def _push_phase_to_aligner(self):
         """Push the current propagated phase images into the aligner (Turbo cmap)."""
@@ -1025,7 +1193,32 @@ class FocusingPanel(QWidget):
             self.aligner.current_transform = tf.AffineTransform(matrix=self._global_matrix)
             self.aligner.transform_controls.set_values_from_transform(self._global_matrix)
         self.aligner.set_moving_array(mov_phase, item["moving_path"])
+        # Also hand the COMPLEX propagated fields to the aligner so the main
+        # window's "Observable" combo works while running a sequence (#1).
+        self._sync_aligner_fields(tpl_prop, mov_prop, item)
         return True
+
+    def _sync_aligner_fields(self, tpl_complex, mov_complex, item):
+        """Expose the panel's propagated complex fields on the aligner so the
+        main window's Observable selector can re-derive amplitude/phase/real/
+        imag at the SAME focus (z already applied here -> aligner z=0)."""
+        a = self.aligner
+        a.template_field = np.asarray(tpl_complex)
+        a.template_field_file = item["template_path"]
+        a.template_z_um = 0.0
+        a.moving_field = np.asarray(mov_complex)
+        a.moving_field_file = item["moving_path"]
+        a.moving_z_um = 0.0
+        # Keep optics in sync so any aligner-side propagation uses the same params.
+        a.propagation_optics.update(self._current_optics())
+        # _push_phase_to_aligner displays the unwrapped PHASE, so start the
+        # aligner's observable selector on "phase" (no recompute) -- this keeps
+        # the combo consistent with what's shown and makes the first toggle work.
+        a.template_observable = a.moving_observable = "phase"
+        if hasattr(a, "observable_combo"):
+            a.observable_combo.blockSignals(True)
+            a.observable_combo.setCurrentText("phase")
+            a.observable_combo.blockSignals(False)
 
     def _read_back_matrix(self, item):
         """Store the aligner's current transform as this row's global matrix.
@@ -1060,7 +1253,8 @@ class FocusingPanel(QWidget):
                 self.aligner.auto_keypoints_scale_translation_headless(
                     detector=action.get("detector", "AKAZE"),
                     matcher=action.get("matcher", "Brute Force"),
-                    ransac_threshold=action.get("ransac_threshold", 5.0))
+                    ransac_threshold=action.get("ransac_threshold", 5.0),
+                    border_crop=action.get("border_crop", 0))
                 self._read_back_matrix(item)
         elif t == "distortion_correct":
             self._exec_distortion(action, item)
@@ -1111,15 +1305,31 @@ class FocusingPanel(QWidget):
                 method=action.get("metric", "gini"), roi=roi, post=post)
             z_um = best_z * 1e6
             self._plot_curve(zs * 1e6, scores, f"Autofocus {target} ({action.get('metric', 'gini')})", z_um)
+            if target == "template":
+                item["z_tpl_um"] = z_um
+            else:
+                item["z_mov_um"] = z_um
+            if target == self._refocus_target:
+                self.z_spin.blockSignals(True); self.z_spin.setValue(z_um); self.z_spin.blockSignals(False)
+                self._draw_field()
         else:
-            z_um = action.get("z_um", 0.0)
-        if target == "template":
-            item["z_tpl_um"] = z_um
-        else:
-            item["z_mov_um"] = z_um
-        if target == self._refocus_target:
-            self.z_spin.blockSignals(True); self.z_spin.setValue(z_um); self.z_spin.blockSignals(False)
-            self._draw_field()
+            # Manual: open the SAME Change-Distance interface as the main window's
+            # method (live slider + 2-D map), pre-targeted to this action's target.
+            self._open_distance_dialog(initial_target=target)
+
+    def _open_distance_dialog(self, initial_target="moving"):
+        """Open the main-window DistanceDialog driven by a panel-backed
+        controller, so manual refocus uses the exact same interface."""
+        from gui import DistanceDialog
+        if self._tpl_field is None and self._mov_field is None:
+            return
+        controller = _PanelDistanceController(self, initial_target=initial_target)
+        dlg = DistanceDialog(controller)
+        # Pre-select the requested target if available.
+        idx = dlg.target.findText(initial_target)
+        if idx >= 0:
+            dlg.target.setCurrentIndex(idx)
+        dlg.exec()
 
     def _exec_distortion(self, action, item):
         if self._tpl_field is None or self._mov_field is None:
@@ -1141,22 +1351,59 @@ class FocusingPanel(QWidget):
         pairs = detect_keypoint_pairs(
             tpl_phase, moving_for_detect, detector=action.get("detector", "AKAZE"),
             matcher=action.get("matcher", "Brute Force"),
-            ransac_threshold=action.get("ransac_threshold", 5.0))
+            ransac_threshold=action.get("ransac_threshold", 5.0),
+            border_crop=action.get("border_crop", 0))
         if len(pairs) < 3:
             self.status_label.setText(f"Distortion: only {len(pairs)} pairs (need >=3) -- skipped.")
             return
         model = action.get("model", "tps")
+        prev_distortion = self._distortion
+        prev_meta = item.get("distortion")
         try:
-            self._distortion = opt.estimate_distortion(pairs, tpl_phase.shape, model=model)
+            new_distortion = opt.estimate_distortion(pairs, tpl_phase.shape, model=model)
         except Exception as e:
             self.status_label.setText(f"Distortion estimate failed: {e}")
             return
+        self._distortion = new_distortion
         item["distortion"] = {
             "model": model,
             "src": [list(p[0]) for p in pairs],
             "dst": [list(p[1]) for p in pairs],
         }
         self.status_label.setText(f"Distortion ({model}) from {len(pairs)} pairs.")
+        # Fit-quality popup: grid + keypoints (#2a), NCC before/after (#2c), Cancel (#2d).
+        try:
+            from gui import show_distortion_fit_quality
+
+            def _ncc(img_a, img_b):
+                a = np.asarray(img_a, np.float64).ravel(); b = np.asarray(img_b, np.float64).ravel()
+                m = (a != 0) & (b != 0)
+                if m.sum() < 16 or np.std(a[m]) < 1e-9 or np.std(b[m]) < 1e-9:
+                    return float("nan")
+                return float(np.corrcoef(a[m], b[m])[0, 1])
+
+            # moving_for_detect is the globally-aligned moving phase (template frame);
+            # 'after' applies the residual distortion to it.
+            corr_before = _ncc(tpl_phase, moving_for_detect)
+            corrected = tf.warp(moving_for_detect, new_distortion,
+                                output_shape=tpl_phase.shape, preserve_range=True)
+            corr_after = _ncc(tpl_phase, corrected)
+
+            def _cancel():
+                self._distortion = prev_distortion
+                item["distortion"] = prev_meta
+                self.status_label.setText("Distortion correction cancelled.")
+
+            params = {"detector": action.get("detector", "AKAZE"),
+                      "matcher": action.get("matcher", "Brute Force"),
+                      "ransac_threshold": action.get("ransac_threshold", 5.0),
+                      "border_crop": action.get("border_crop", 0)}
+            show_distortion_fit_quality(self, self._distortion, pairs, tpl_phase.shape, model,
+                                        corr_before=corr_before, corr_after=corr_after,
+                                        on_cancel=_cancel, params=params,
+                                        modal=self._blocking_run)
+        except Exception as e:
+            print(f"Distortion fit-quality popup failed: {e}")
 
     def _distortion_from_dict(self, d):
         if not d:
@@ -1172,43 +1419,109 @@ class FocusingPanel(QWidget):
     def _exec_focus_check(self, action, item):
         if self._tpl_field is None or self._mov_field is None:
             return
+        from batchMode import FocusMapWindow
         px_tpl, px_mov, lam, n = self._pixel_sizes()
-        # Align the moving field into the template frame before comparing. With a
-        # transform, warp into the template shape; otherwise fit (edge-pad) so the
-        # two fields share a shape without a zero-padded border.
-        if self._global_matrix is not None or self._distortion is not None:
-            gm = self._global_matrix if self._global_matrix is not None else np.eye(3)
-            mov_aligned = opt.warp_field_with_distortion(self._mov_field, gm, self._distortion,
-                                                         self._tpl_field.shape)
-            fit_b = None
-        else:
-            mov_aligned = self._mov_field  # fit each propagated frame in the map
-            fit_b = (lambda f: self._fit_to_template(f, self._tpl_field.shape))
-        half = action.get("half_range_um", 5.0) * 1e-6
-        step = action.get("step_nm", 100.0) * 1e-9
+        tpl_shape = self._tpl_field.shape
         roi = tuple(action["roi"]) if action.get("roi") else self._roi
-        # 2-D map: template over z around z_tpl, moving over z around z_mov.
-        z_rel = opt.focus_z_values(half, step)
-        z_tpl = z_rel + item["z_tpl_um"] * 1e-6
-        z_mov = z_rel + item["z_mov_um"] * 1e-6
-        za, zb, map2d = opt.focus_consistency_map(
-            self._tpl_field, mov_aligned, z_tpl, z_mov, lam, lam, px_tpl, px_tpl,
-            n=n, metric=action.get("metric", "ncc"), roi=roi, fit_b=fit_b)
-        if np.any(np.isfinite(map2d)):
-            jb, ia = np.unravel_index(np.nanargmax(map2d), map2d.shape)
-            item["corr"] = float(map2d[jb, ia])
-            peak_za, peak_zb = float(za[ia]), float(zb[jb])
+
+        # Central-ROI fraction: run the map on a centered crop for speed; the
+        # chosen z is applied full-frame on save (#1). Default 25%.
+        roi_frac = float(action.get("roi_frac", 0.5))
+        tpl_in = opt.center_crop(self._tpl_field, roi_frac)
+        mov_in = opt.center_crop(self._mov_field, roi_frac)
+
+        # Alignment-aware: bring each propagated moving frame into the template
+        # frame via the global matrix + distortion (or just fit when none). The
+        # overlap + 16px border crop inside the map handles edge artifacts. On a
+        # centered crop the full-frame linear matrix doesn't apply, so just fit.
+        gm = self._global_matrix if self._global_matrix is not None else np.eye(3)
+        distortion = self._distortion
+        if roi_frac < 1.0:
+            crop_shape = tpl_in.shape
+            align_b = lambda field: self._fit_to_template(field, crop_shape)
         else:
-            item["corr"] = None
-            peak_za = peak_zb = 0.0
-        self._plot_focus_map(za * 1e6, zb * 1e6, map2d,
-                             item["z_tpl_um"], item["z_mov_um"],
-                             peak_za * 1e6, peak_zb * 1e6,
-                             action.get("metric", "ncc"))
-        if abs(peak_za - item["z_tpl_um"] * 1e-6) > step * 2 or abs(peak_zb - item["z_mov_um"] * 1e-6) > step * 2:
+            def align_b(field):
+                if self._global_matrix is not None or distortion is not None:
+                    return opt.warp_field_with_distortion(field, gm, distortion, tpl_shape)
+                return self._fit_to_template(field, tpl_shape)
+
+        # Separate template / moving ranges, each centred on its current focus.
+        z_tpl = item["z_tpl_um"] * 1e-6 + opt.focus_z_values(
+            action.get("half_tpl_um", 5.0) * 1e-6, action.get("step_tpl_nm", 100.0) * 1e-9)
+        z_mov = item["z_mov_um"] * 1e-6 + opt.focus_z_values(
+            action.get("half_mov_um", 5.0) * 1e-6, action.get("step_mov_nm", 100.0) * 1e-9)
+        metric = action.get("metric", "ncc")
+
+        win = self._ensure_focus_map_window(FocusMapWindow, item)
+        win.show(); win.raise_(); win.activateWindow()
+
+        # When cropping, the rectangular ROI no longer maps onto the crop coords.
+        crop_roi = roi if roi_frac >= 1.0 else None
+        za, zb, map2d = opt.focus_consistency_map(
+            tpl_in, mov_in, z_tpl, z_mov, lam, lam, px_tpl, px_mov,
+            n=n, metric=metric, roi=crop_roi, align_b=align_b, border=16,
+            progress=win.set_progress)
+
+        ref_col = int(np.argmin(np.abs(za - item["z_tpl_um"] * 1e-6)))
+        ref_row = int(np.argmin(np.abs(zb - item["z_mov_um"] * 1e-6)))
+        win.set_map(za * 1e6, zb * 1e6, map2d, metric, ref_col=ref_col, ref_row=ref_row)
+        if np.any(np.isfinite(map2d)):
+            item["corr"] = float(np.nanmax(map2d))
+        # Context for click-overlay + "Use optimal". The click overlays the FULL
+        # frame, so it must use a full-shape align_b (warp into tpl_shape), NOT
+        # the crop-shape align_b used for the (ROI) map -- otherwise the moving
+        # appears tiny in a corner.
+        def overlay_align_b(field):
+            # The global matrix was estimated on the template-shape-FITTED moving
+            # (see _push_phase_to_aligner), so fit FIRST, then warp -- otherwise
+            # the matrix maps fit-frame coords against a larger prescaled field
+            # and the translation lands wrong / looks unapplied (#1 regression).
+            field = self._fit_to_template(field, tpl_shape)
+            if self._global_matrix is not None or distortion is not None:
+                return opt.warp_field_with_distortion(field, gm, distortion, tpl_shape)
+            return field
+        self._fc_ctx = {"lam": lam, "n": n, "px_tpl": px_tpl, "px_mov": px_mov,
+                        "align_b": overlay_align_b, "item": item}
+        # During a Run, pause here until the user picks an optimum ('Use optimal')
+        # or closes the map window, before the sequence continues.
+        if self._blocking_run:
+            self.status_label.setText("Focus map: pick an optimum ('Use optimal') or close to continue…")
+            win.wait_until_closed()
+
+    def _ensure_focus_map_window(self, FocusMapWindow, item):
+        """Create/reuse the shared 2-D focus-map window for focus_check."""
+        def use_optimal(z_tpl_um, z_mov_um):
+            item["z_tpl_um"] = float(z_tpl_um)
+            item["z_mov_um"] = float(z_mov_um)
+            self._update_row(self.current_index)
             self.status_label.setText(
-                f"Focus check: co-focus peak at z_tpl={peak_za * 1e6:.2f}, "
-                f"z_mov={peak_zb * 1e6:.2f} um (away from current focus).")
+                f"Focus: z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm (applied).")
+            self._draw_field()
+
+        def on_cell(z_tpl_um, z_mov_um):
+            ctx = getattr(self, "_fc_ctx", None)
+            if not ctx:
+                return
+            tpl = opt.propagate_asm(self._tpl_field, z_tpl_um * 1e-6, ctx["lam"], ctx["px_tpl"], n=ctx["n"])
+            mov = ctx["align_b"](opt.propagate_asm(self._mov_field, z_mov_um * 1e-6, ctx["lam"], ctx["px_mov"], n=ctx["n"]))
+            a = self.aligner
+            row = self.rows[self.current_index]
+            a.template_color.setCurrentText(ALIGN_CMAP); a.moving_color.setCurrentText(ALIGN_CMAP)
+            # Render the panel's chosen observable (e.g. PHASE) directly so the
+            # click shows the right channel immediately -- no stale-toggle needed
+            # (bug #1). Pure display: doesn't mutate the panel's complex fields.
+            a.template_image = self._field_to_observable(tpl); a.template_image_file = row["template_path"]
+            a.transform_controls.set_template_shape(a.template_image.shape)
+            a.moving_image = self._field_to_observable(mov); a.transformed_image = a.moving_image
+            a.moving_image_file = row["moving_path"]
+            a.onViewModeChanged("overlay"); a.update_display()
+
+        if self._focus_map_window is None:
+            self._focus_map_window = FocusMapWindow(on_use_optimal=use_optimal, on_cell=on_cell)
+        else:
+            self._focus_map_window._on_use_optimal = use_optimal
+            self._focus_map_window._on_cell = on_cell
+        return self._focus_map_window
 
     def _exec_save(self, action, item):
         """Save template and/or moving wavefront(s), all or one channel.
@@ -1237,13 +1550,49 @@ class FocusingPanel(QWidget):
             out_path = self._save_target(which, item, action, out_dir, suffix)
             if out_path:
                 saved.append(Path(out_path).name)
+            # Secondary images of this target: same transform, never displayed (#1).
+            sec_key = "secondary_moving_paths" if which == "moving" else "secondary_template_paths"
+            for sec_path in item.get(sec_key, []):
+                sp = self._save_target(which, item, action, out_dir, suffix, path_override=sec_path)
+                if sp:
+                    saved.append(Path(sp).name)
         if saved:
             self.status_label.setText(f"Saved {', '.join(saved)}")
 
-    def _save_target(self, which, item, action, out_dir, suffix):
-        """Warp + save one target ('template' or 'moving'); return output path."""
-        path = item["moving_path"] if which == "moving" else item["template_path"]
-        n_frames = item["n_frames_mov"] if which == "moving" else item["n_frames_tpl"]
+    def _warp_moving_for_save(self, field, z_um, lam, px, n, out_shape):
+        """Refocus + align a moving field for export, FILLING borders (#2).
+
+        Scale to template sampling, refocus on the native grid, then warp the
+        **un-cropped** field into the template-shaped output. The alignment
+        matrix was estimated on the centered crop, so the warp uses
+        ``input_offset = crop offset`` to sample the larger FOV -- output borders
+        fill from the moving periphery instead of going black."""
+        field = self._prescale_moving(field)
+        field = opt.propagate_asm(field, z_um * 1e-6, lam, px, n=n)
+        if out_shape is None:
+            return field
+        offset = self._fit_offset(field.shape, out_shape)
+        gm = self._global_matrix if self._global_matrix is not None else np.eye(3)
+        return opt.warp_field_with_distortion(
+            field, gm, self._distortion, out_shape, input_offset=offset)
+
+    def _save_target(self, which, item, action, out_dir, suffix, path_override=None):
+        """Warp + save one target ('template' or 'moving'); return output path.
+
+        ``path_override`` saves a SECONDARY image of that target with the SAME
+        transform (#1); its frame count is read from the file (it may differ
+        from the primary)."""
+        path = path_override or (item["moving_path"] if which == "moving" else item["template_path"])
+        if not path:
+            return None
+        if path_override:
+            try:
+                _p, _a, n_frames = load_wavefront_tif(path, frame_index=0)
+            except Exception as e:
+                self.status_label.setText(f"Secondary {Path(path).name} skipped: {e}")
+                return None
+        else:
+            n_frames = item["n_frames_mov"] if which == "moving" else item["n_frames_tpl"]
         z_um = item["z_mov_um"] if which == "moving" else item["z_tpl_um"]
         px_tpl, px_mov, lam, n = self._pixel_sizes()
         px = px_mov if which == "moving" else px_tpl
@@ -1259,17 +1608,7 @@ class FocusingPanel(QWidget):
             p, a, _ = load_wavefront_tif(path, fi)
             field = opt.field_from_phase_amp(p, a)
             if which == "moving":
-                # Scale to template sampling, refocus on the NATIVE grid (no pad
-                # propagated), fit to the template shape (matching the frame the
-                # alignment matrix was estimated on), then align-warp.
-                field = self._prescale_moving(field)
-                field = opt.propagate_asm(field, z_um * 1e-6, lam, px, n=n)
-                if out_shape is not None:
-                    field = self._fit_to_template(field, out_shape)
-                gm = self._global_matrix if self._global_matrix is not None else np.eye(3)
-                field = opt.warp_field_with_distortion(
-                    field, gm, self._distortion,
-                    out_shape if out_shape is not None else field.shape)
+                field = self._warp_moving_for_save(field, z_um, lam, px, n, out_shape)
             else:
                 # Template: refocus only (it is the reference frame).
                 field = opt.propagate_asm(field, z_um * 1e-6, lam, px, n=n)
@@ -1334,8 +1673,14 @@ class FocusingPanel(QWidget):
         if not self.actions:
             QMessageBox.information(self, "Focusing", "No actions in the sequence.")
             return
-        for action in self.actions:
-            self._execute_action(action)
+        # Blocking run: pause on the 2-D map / distortion popups until the user
+        # acts (Use optimal / Close / Cancel) before the next step.
+        self._blocking_run = True
+        try:
+            for action in self.actions:
+                self._execute_action(action)
+        finally:
+            self._blocking_run = False
         self._step_index = len(self.actions)
         self._update_status()
 
@@ -1347,14 +1692,18 @@ class FocusingPanel(QWidget):
         progress = QProgressDialog("Running focusing pipeline...", "Cancel", 0, len(rows), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.show()
-        for n, r in enumerate(rows):
-            if progress.wasCanceled():
-                break
-            self.table.setCurrentCell(r, 0)  # _send_to_window rebuilds working state
-            self._send_to_window(r)
-            for action in self.actions:
-                self._execute_action(action)
-            progress.setValue(n + 1)
+        self._blocking_run = True
+        try:
+            for n, r in enumerate(rows):
+                if progress.wasCanceled():
+                    break
+                self.table.setCurrentCell(r, 0)  # _send_to_window rebuilds working state
+                self._send_to_window(r)
+                for action in self.actions:
+                    self._execute_action(action)
+                progress.setValue(n + 1)  # last step done -> advance to next row
+        finally:
+            self._blocking_run = False
         progress.close()
         self._update_status()
 
@@ -1411,3 +1760,172 @@ class FocusingPanel(QWidget):
         lf = "  ·  live feedback ON" if self._live_feedback else ""
         self.status_label.setText(
             f"{n} sample(s)  ·  {n_done} done  ·  {len(self.actions)} action(s){step}{cur}{lf}")
+
+
+class _PanelDistanceController:
+    """Adapts :class:`FocusingPanel` (current row) to the ``DistanceDialog``
+    controller API, so the manual-refocus step reuses the SAME dialog as the
+    main window's Change-Distance method.
+
+    Note: the panel's ``_mov_field`` is already pre-scaled to the TEMPLATE
+    sampling, so propagation for BOTH targets uses the template pixel size, and
+    ``align_b`` only fits + warps (no magnification rescale).
+    """
+
+    def __init__(self, panel, initial_target="moving"):
+        self.p = panel
+        self.parent_widget = panel
+
+    def targets(self):
+        out = []
+        if self.p._mov_field is not None:
+            out.append("moving")
+        if self.p._tpl_field is not None:
+            out.append("template")
+        return out
+
+    def optics(self):
+        return self.p._current_optics()
+
+    def magnification(self, target):
+        o = self.p._current_optics()
+        return o["mag_tpl"] if target == "template" else o["mag_mov"]
+
+    def set_optics(self, target, mag, wl, px, n):
+        # Write back into the panel's optics widgets.
+        o = self.p._current_optics()
+        o["mag_tpl" if target == "template" else "mag_mov"] = mag
+        o.update({"wavelength_nm": wl, "camera_pixel_um": px, "n": n})
+        self.p._apply_optics_to_widgets(o)
+
+    def _item(self):
+        i = self.p.current_index
+        return self.p.rows[i] if 0 <= i < len(self.p.rows) else None
+
+    def current_z(self, target):
+        it = self._item()
+        if it is None:
+            return 0.0
+        return it["z_tpl_um"] if target == "template" else it["z_mov_um"]
+
+    def set_distance(self, target, z_um, roi_frac=1.0):
+        it = self._item()
+        if it is None:
+            return
+        if target == "template":
+            it["z_tpl_um"] = float(z_um)
+        else:
+            it["z_mov_um"] = float(z_um)
+        self.p._update_row(self.p.current_index)
+        # Reflect on the panel's own refocus view.
+        if target == self.p._refocus_target:
+            self.p.z_spin.blockSignals(True); self.p.z_spin.setValue(float(z_um)); self.p.z_spin.blockSignals(False)
+            self.p._draw_field()
+        # Live feedback in the MAIN window while sliding -- on the central ROI
+        # crop for speed (#1/#3). PRESERVE the user's channel/colormap/opacity
+        # (#2); favored opacity is applied only on target switch.
+        self._render_main(active_target=target, set_opacity=False, roi_frac=roi_frac)
+
+    def _render_main(self, active_target, set_opacity=True, roi_frac=1.0):
+        """Render the current row's propagated template+moving in the main window.
+
+        ``set_opacity`` (target-switch only) favors the adjusted target
+        (template α=100/moving α=0, or inverse); during slider drags it is False
+        so the user's manual opacity/colormap choices are kept (#2). ``roi_frac``
+        restricts the live preview to a centered crop for speed."""
+        it = self._item()
+        if it is None or self.p._tpl_field is None or self.p._mov_field is None:
+            return
+        a = self.p.aligner
+        if set_opacity:
+            # Target switch: ensure overlay mode + favored opacity (resets to the
+            # template/moving emphasis), then the user may re-tweak alpha/channel.
+            a.onViewModeChanged("overlay")
+            if active_target == "template":
+                a.template_opacity.setValue(100); a.moving_opacity.setValue(0)
+            else:
+                a.template_opacity.setValue(0); a.moving_opacity.setValue(100)
+        self.overlay_cell(it["z_tpl_um"], it["z_mov_um"], self.align_b(roi_frac),
+                          force_colormap=False, roi_frac=roi_frac)
+        a.raise_(); a.activateWindow()
+
+    def reset(self, target, roi_frac=1.0):
+        self.set_distance(target, 0.0, roi_frac=roi_frac)
+
+    def on_target_shown(self, target, roi_frac=1.0):
+        """Refresh the main-window live preview when the dialog target changes,
+        favoring the newly selected target's opacity (no z change)."""
+        self._render_main(active_target=target, roi_frac=roi_frac)
+
+    def both_wavefronts(self):
+        return self.p._tpl_field is not None and self.p._mov_field is not None
+
+    def fields(self, roi_frac=1.0):
+        # Both fields are at template sampling (moving is pre-scaled), so a
+        # centered crop of each is a valid co-focus comparison region (#1).
+        return (opt.center_crop(self.p._tpl_field, roi_frac),
+                opt.center_crop(self.p._mov_field, roi_frac))
+
+    def pixel_sizes(self):
+        px_tpl, _px_mov, lam, n = self.p._pixel_sizes()
+        # Moving field is pre-scaled to template sampling -> use px_tpl for both.
+        return px_tpl, px_tpl, lam, n
+
+    def align_b(self, roi_frac=1.0):
+        p = self.p
+        gm = p._global_matrix if p._global_matrix is not None else np.eye(3)
+        distortion = p._distortion
+        if roi_frac is not None and roi_frac < 1.0:
+            # Focus search on the centered crop: the full-frame linear matrix
+            # doesn't apply to crop coords, so just fit moving to the cropped
+            # template shape (focus is what matters over a centered ROI).
+            cropped_tpl_shape = opt.center_crop(p._tpl_field, roi_frac).shape
+            return lambda field: p._fit_to_template(field, cropped_tpl_shape)
+        tpl_shape = p._tpl_field.shape
+
+        def f(field):
+            field = p._fit_to_template(field, tpl_shape)
+            if p._global_matrix is not None or distortion is not None:
+                field = opt.warp_field_with_distortion(field, gm, distortion, tpl_shape)
+            return field
+        return f
+
+    def apply_optimal(self, z_tpl_um, z_mov_um):
+        self.set_distance("template", z_tpl_um)
+        self.set_distance("moving", z_mov_um)
+
+    def overlay_cell(self, z_tpl_um, z_mov_um, align_b, force_colormap=True, roi_frac=1.0):
+        """Render template@z_tpl + aligned moving@z_mov into the main window.
+
+        ``force_colormap`` (used by the 2-D map click) sets Turbo; the live
+        distance preview passes False so the user's channel/colormap/alpha are
+        preserved (#2). The displayed observable follows the panel's selectors.
+        ``roi_frac`` < 1 propagates only the centered crop (much faster for the
+        live distance slider) — the preview then shows that ROI; the chosen z is
+        applied to the full frame elsewhere (save / 2-D map 'Use optimal')."""
+        p = self.p
+        px_tpl, px_mov, lam, n = self.pixel_sizes()
+        a = p.aligner
+        # Crop BEFORE propagation so the FFT runs on the small ROI (#3).
+        tpl_in = opt.center_crop(p._tpl_field, roi_frac)
+        mov_in = opt.center_crop(p._mov_field, roi_frac)
+        tpl = opt.propagate_asm(tpl_in, z_tpl_um * 1e-6, lam, px_tpl, n=n)
+        mov = align_b(opt.propagate_asm(mov_in, z_mov_um * 1e-6, lam, px_mov, n=n))
+        if force_colormap:
+            a.template_color.setCurrentText(ALIGN_CMAP); a.moving_color.setCurrentText(ALIGN_CMAP)
+        a.template_image = p._field_to_observable(tpl)
+        a.transform_controls.set_template_shape(a.template_image.shape)
+        a.moving_image = p._field_to_observable(mov); a.transformed_image = a.moving_image
+        a.moving_image_file = p.rows[p.current_index]["moving_path"]
+        a.template_image_file = p.rows[p.current_index]["template_path"]
+        # Hand the (already-propagated, already-aligned) complex fields to the
+        # aligner so its Observable selector re-derives this exact view (#1).
+        # The moving is already aligned -> clear the aligner transform so the
+        # observable recompute does NOT warp it again (this is a display preview;
+        # the real matrix/distortion stay on the panel in _global_matrix/_distortion).
+        a.current_transform = None
+        a.distortion_transform = None
+        a.template_field = np.asarray(tpl); a.template_z_um = 0.0
+        a.moving_field = np.asarray(mov); a.moving_z_um = 0.0
+        a.propagation_optics.update(p._current_optics())
+        a.update_display()  # do NOT onViewModeChanged -> keeps user's opacity

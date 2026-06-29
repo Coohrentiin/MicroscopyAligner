@@ -20,14 +20,23 @@ explicit ``reset`` action clears it.
 import json
 from pathlib import Path
 
+import numpy as np
 from natsort import natsorted
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton, QTableWidget,
     QTableWidgetItem, QListWidget, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
-    QFileDialog, QMessageBox, QHeaderView, QCheckBox, QLineEdit,
+    QFileDialog, QMessageBox, QHeaderView, QCheckBox, QLineEdit, QProgressBar,
+    QApplication,
 )
 from PySide6.QtCore import Qt
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
+import optics as opt
 
 
 IMAGE_FILTER = "Image Files (*.tif *.tiff *.png *.jpg);;TIFF Files (*.tif *.tiff)"
@@ -37,11 +46,17 @@ ACTION_TYPES = [
     ("set_matrix", "Set matrix values (scale / rotation / tx / ty)"),
     ("auto_keypoints", "Auto keypoint detection"),
     ("cross_correlation", "Cross-correlation alignment"),
+    ("propagation_map", "Propagation 2D map (focus, ASM)"),
     ("reset", "Reset transform"),
     ("save_image", "Save moving image"),
     ("save_stack", "Save on stack"),
 ]
 ACTION_LABELS = dict(ACTION_TYPES)
+
+DEFAULT_OPTICS = {
+    "mag_tpl": 20.0, "na_tpl": 0.8, "mag_mov": 10.0, "na_mov": 0.45,
+    "wavelength_nm": 660.0, "camera_pixel_um": 5.86, "n": 1.0,
+}
 
 
 def _action_summary(action):
@@ -66,14 +81,188 @@ def _action_summary(action):
         extra_txt = (", " + ", ".join(extra)) if extra else ""
         return (f"Auto keypoint detection (headless: {action.get('detector', 'AKAZE')} / "
                 f"{action.get('matcher', 'Brute Force')}, RANSAC={action.get('ransac_threshold', 5.0):g}{extra_txt})")
+    if t == "propagation_map":
+        preset = action.get("preset", "focus")
+        return (f"Propagation 2D map ({action.get('metric', 'ncc')}) -> preset '{preset}' "
+                f"[tpl ±{action.get('half_tpl_um', 5):g}/{action.get('step_tpl_nm', 200):g}nm, "
+                f"mov ±{action.get('half_mov_um', 5):g}/{action.get('step_mov_nm', 200):g}nm]")
     if t in ("save_image", "save_stack"):
         label = ACTION_LABELS.get(t, t)
+        preset = action.get("focus_preset")
+        ptxt = f" [propagate preset '{preset}']" if preset else ""
         folder = action.get("folder")
         if folder:
             suffix = action.get("suffix", "")
-            return f"{label} -> {folder} (name{('+' + suffix) if suffix else ''})"
-        return f"{label} (prompt)"
+            return f"{label} -> {folder} (name{('+' + suffix) if suffix else ''}){ptxt}"
+        return f"{label} (prompt){ptxt}"
     return ACTION_LABELS.get(t, t)
+
+
+class FocusMapWindow(QWidget):
+    """Separate plot window showing a 2-D propagation/focus-consistency map.
+
+    x = template z (µm), y = moving z (µm); brighter = better metric. The
+    selected focal point (per the focal-point mode) is marked; "Use optimal"
+    calls ``on_use_optimal(z_tpl_um, z_mov_um)`` so the panel can store the
+    distances as a named preset. Clicking a cell calls ``on_cell(z_tpl_um,
+    z_mov_um)`` for a live overlay in the main window.
+
+    Focal-point modes (item 4/6):
+    - ``global``      : argmax of the whole map.
+    - ``vs_template`` : best moving z at the current template-focus column.
+    - ``vs_moving``   : best template z at the current moving-focus row.
+    "Go to optimal" buttons cycle between these.
+    """
+
+    MODES = [("global", "Global optimum"),
+             ("vs_template", "Optimal vs template focus"),
+             ("vs_moving", "Optimal vs moving focus")]
+
+    def __init__(self, on_use_optimal=None, on_cell=None):
+        super().__init__()
+        self.setWindowTitle("Propagation 2D Map")
+        self.resize(620, 680)
+        self._on_use_optimal = on_use_optimal
+        self._on_cell = on_cell
+        self._loop = None                # local event loop when run modally
+        self._peak = (0.0, 0.0)          # currently selected (z_tpl_um, z_mov_um)
+        self._za = self._zb = None
+        self._map = None
+        self._metric = "ncc"
+        # Reference indices for the line-constrained optima (the current focus).
+        self._ref_col = None             # template column index
+        self._ref_row = None             # moving row index
+
+        v = QVBoxLayout(self)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Focal point:"))
+        self.mode_combo = QComboBox()
+        for key, label in self.MODES:
+            self.mode_combo.addItem(label, key)
+        self.mode_combo.currentIndexChanged.connect(self._update_marker)
+        mode_row.addWidget(self.mode_combo)
+        prev_btn = QPushButton("◀ Go to optimal")
+        prev_btn.clicked.connect(lambda: self._cycle_mode(-1))
+        next_btn = QPushButton("Go to optimal ▶")
+        next_btn.clicked.connect(lambda: self._cycle_mode(1))
+        mode_row.addWidget(prev_btn); mode_row.addWidget(next_btn)
+        mode_row.addStretch()
+        v.addLayout(mode_row)
+
+        self.fig = Figure(figsize=(5, 5), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+        v.addWidget(self.canvas, stretch=1)
+
+        self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        v.addWidget(self.progress)
+
+        row = QHBoxLayout()
+        self.info = QLabel("No map yet."); self.info.setStyleSheet("font-weight: bold;")
+        row.addWidget(self.info, stretch=1)
+        self.use_btn = QPushButton("Use optimal")
+        self.use_btn.setStyleSheet("QPushButton { background-color: #4CAF50; }")
+        self.use_btn.clicked.connect(self._use_optimal)
+        self.use_btn.setEnabled(False)
+        row.addWidget(self.use_btn)
+        v.addLayout(row)
+
+    def set_progress(self, done, total):
+        self.progress.setMaximum(max(1, total))
+        self.progress.setValue(done)
+        QApplication.processEvents()
+
+    def set_map(self, za_um, zb_um, map2d, metric, ref_col=None, ref_row=None):
+        """Store the map + render it; ``ref_col``/``ref_row`` are the current
+        template/moving focus indices used by the line-constrained modes."""
+        self._za = np.asarray(za_um, dtype=float)
+        self._zb = np.asarray(zb_um, dtype=float)
+        self._map = np.asarray(map2d, dtype=float)
+        self._metric = metric
+        self._ref_col = ref_col
+        self._ref_row = ref_row
+        self.progress.setValue(self.progress.maximum())
+        self._update_marker()
+
+    def _selected_indices(self):
+        mode = self.mode_combo.currentData()
+        return opt.optimal_indices(self._map, mode=mode,
+                                   ref_col=self._ref_col, ref_row=self._ref_row)
+
+    def _update_marker(self):
+        if self._map is None:
+            return
+        self.ax.clear()
+        extent = [self._za[0], self._za[-1], self._zb[-1], self._zb[0]]  # origin upper
+        im = self.ax.imshow(self._map, aspect="auto", cmap="viridis",
+                            extent=extent, origin="upper")
+        # Mark the CURRENT focus point (ref indices) for reference (item 1).
+        if self._ref_col is not None and self._ref_row is not None:
+            self.ax.plot(self._za[self._ref_col], self._zb[self._ref_row],
+                         "o", markerfacecolor="none", markeredgecolor="white",
+                         markersize=12, markeredgewidth=1.5, label="current")
+        idx = self._selected_indices()
+        if idx is not None:
+            i_col, j_row = idx
+            self._peak = (float(self._za[i_col]), float(self._zb[j_row]))
+            self.ax.plot(self._peak[0], self._peak[1], "r+", markersize=16,
+                         markeredgewidth=2, label="optimum")
+            self.ax.legend(loc="upper right", fontsize=7, framealpha=0.6)
+            # Show the constraint line for the current mode.
+            mode = self.mode_combo.currentData()
+            if mode == "vs_template" and self._ref_col is not None:
+                self.ax.axvline(self._za[self._ref_col], color="white", lw=0.8, ls="--")
+            elif mode == "vs_moving" and self._ref_row is not None:
+                self.ax.axhline(self._zb[self._ref_row], color="white", lw=0.8, ls="--")
+            self.info.setText(f"{self.mode_combo.currentText()} ({self._metric}): "
+                              f"z_tpl={self._peak[0]:.2f} µm, z_mov={self._peak[1]:.2f} µm")
+            self.use_btn.setEnabled(True)
+        else:
+            self.info.setText("Map all-NaN (degenerate); no optimum.")
+            self.use_btn.setEnabled(False)
+        self.ax.set_title(f"Propagation map ({self._metric})  ·  click for live overlay", fontsize=9)
+        self.ax.set_xlabel("template z (µm)"); self.ax.set_ylabel("moving z (µm)")
+        try:
+            self.fig.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
+        except Exception:
+            pass
+        self.canvas.draw_idle()
+
+    def _cycle_mode(self, delta):
+        n = self.mode_combo.count()
+        self.mode_combo.setCurrentIndex((self.mode_combo.currentIndex() + delta) % n)
+
+    def _on_click(self, event):
+        """Live feedback: clicking a cell overlays template@z_tpl / moving@z_mov
+        in the main window via ``on_cell``."""
+        if event.inaxes is not self.ax or event.xdata is None or self._on_cell is None:
+            return
+        self._on_cell(float(event.xdata), float(event.ydata))
+
+    def _use_optimal(self):
+        # Apply the chosen optimum (and refresh) BEFORE ending any modal wait, so
+        # 'Use optimal' actually takes effect during a Run.
+        if self._on_use_optimal is not None:
+            self._on_use_optimal(self._peak[0], self._peak[1])
+        self._end_wait()
+
+    def wait_until_closed(self):
+        """Block (local event loop) until the user uses 'Use optimal' or closes
+        the window -- so a sequence Run pauses on the 2-D map."""
+        from PySide6.QtCore import QEventLoop
+        self._loop = QEventLoop()
+        self._loop.exec()
+        self._loop = None
+
+    def _end_wait(self):
+        if self._loop is not None and self._loop.isRunning():
+            self._loop.quit()
+
+    def closeEvent(self, event):
+        self._end_wait()
+        super().closeEvent(event)
 
 
 class BatchModePanel(QWidget):
@@ -108,6 +297,12 @@ class BatchModePanel(QWidget):
         # Which moving column the editor is bound to
         self.edit_column = 0
 
+        # Named focus presets {name: {"z_tpl_um", "z_mov_um", "optics": {...}}}
+        # produced by the propagation-map action's "Use optimal" and reusable by
+        # any column's save_stack without recomputation.
+        self.focus_presets = {}
+        self.focus_map_window = None
+
         self._init_ui()
         self._rebuild_table_from_model()
         self.table.setCurrentCell(0, 1)  # select first moving cell
@@ -130,6 +325,32 @@ class BatchModePanel(QWidget):
         for s in self.sequences:
             while len(s["moving_paths"]) < n:
                 s["moving_paths"].append("")
+
+    @staticmethod
+    def _optic_spin(val, suffix, lo, hi, step=None, decimals=2):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(decimals)
+        s.setValue(val); s.setSuffix(suffix); s.setMaximumWidth(110)
+        if step is not None:
+            s.setSingleStep(step)
+        return s
+
+    def _pm_optics(self):
+        """Optics dict from the propagation-map option widgets."""
+        return {
+            "mag_tpl": self.pm_mag_tpl.value(), "na_tpl": self.pm_na_tpl.value(),
+            "mag_mov": self.pm_mag_mov.value(), "na_mov": self.pm_na_mov.value(),
+            "wavelength_nm": self.pm_wl.value(), "camera_pixel_um": self.pm_px.value(),
+            "n": DEFAULT_OPTICS["n"],
+        }
+
+    def _refresh_preset_combo(self):
+        """Repopulate the save_stack preset selector from ``focus_presets``."""
+        self.save_preset_combo.blockSignals(True)
+        self.save_preset_combo.clear()
+        self.save_preset_combo.addItem("(none)", None)
+        for name in self.focus_presets:
+            self.save_preset_combo.addItem(name, name)
+        self.save_preset_combo.blockSignals(False)
 
     # --------------------------------------------------------------------- UI
     def _init_ui(self):
@@ -231,6 +452,29 @@ class BatchModePanel(QWidget):
         self.auto_row.addStretch()
         v.addLayout(self.auto_row)
 
+        # --- propagation_map options ---
+        self.prop_row = QHBoxLayout()
+        self.pm_mag_tpl = self._optic_spin(DEFAULT_OPTICS["mag_tpl"], " tplx", 0.1, 200)
+        self.pm_na_tpl = self._optic_spin(DEFAULT_OPTICS["na_tpl"], " tplNA", 0.01, 1.6, 0.01, 3)
+        self.pm_mag_mov = self._optic_spin(DEFAULT_OPTICS["mag_mov"], " movx", 0.1, 200)
+        self.pm_na_mov = self._optic_spin(DEFAULT_OPTICS["na_mov"], " movNA", 0.01, 1.6, 0.01, 3)
+        self.pm_wl = self._optic_spin(DEFAULT_OPTICS["wavelength_nm"], " nm", 100, 2000)
+        self.pm_px = self._optic_spin(DEFAULT_OPTICS["camera_pixel_um"], " umpx", 0.1, 100, 0.01, 3)
+        self.pm_center_tpl = self._optic_spin(0.0, " ctpl", -500, 500, 0.1, 3)
+        self.pm_step_tpl = self._optic_spin(200.0, " sTplnm", 10, 5000)
+        self.pm_half_tpl = self._optic_spin(5.0, " ±tplum", 0.1, 200)
+        self.pm_center_mov = self._optic_spin(0.0, " cmov", -500, 500, 0.1, 3)
+        self.pm_step_mov = self._optic_spin(200.0, " sMovnm", 10, 5000)
+        self.pm_half_mov = self._optic_spin(5.0, " ±movum", 0.1, 200)
+        self.pm_metric = QComboBox(); self.pm_metric.addItems(["ncc", "l2", "ssim"])
+        self.pm_preset = QLineEdit(); self.pm_preset.setPlaceholderText("preset name"); self.pm_preset.setMaximumWidth(120)
+        self.pm_widgets = [self.pm_mag_tpl, self.pm_na_tpl, self.pm_mag_mov, self.pm_na_mov,
+                           self.pm_wl, self.pm_px, self.pm_center_tpl, self.pm_step_tpl, self.pm_half_tpl,
+                           self.pm_center_mov, self.pm_step_mov, self.pm_half_mov, self.pm_metric, self.pm_preset]
+        for w in self.pm_widgets:
+            self.prop_row.addWidget(w)
+        v.addLayout(self.prop_row)
+
         # --- save options (save_image / save_stack) ---
         self.save_row = QHBoxLayout()
         self.save_use_folder = QCheckBox("Save to folder")
@@ -244,6 +488,10 @@ class BatchModePanel(QWidget):
         self.save_suffix_edit = QLineEdit(); self.save_suffix_edit.setPlaceholderText("suffix (e.g. _aligned)")
         self.save_suffix_edit.setMaximumWidth(160)
         self.save_row.addWidget(self.save_suffix_edit)
+        # save_stack can propagate by a named focus preset before transform/distort.
+        self.save_row.addWidget(QLabel("Propagate preset:"))
+        self.save_preset_combo = QComboBox()
+        self.save_row.addWidget(self.save_preset_combo)
         v.addLayout(self.save_row)
 
         edit_row = QHBoxLayout()
@@ -411,6 +659,7 @@ class BatchModePanel(QWidget):
             for action in self.column_actions[self.edit_column]:
                 self.action_list.addItem(_action_summary(action))
         self._refresh_copy_combo()
+        self._refresh_preset_combo()
 
     def _refresh_copy_combo(self):
         self.copy_from_combo.blockSignals(True)
@@ -430,6 +679,7 @@ class BatchModePanel(QWidget):
         atype = self.action_combo.currentData()
         self._set_row_visible(self.matrix_row, atype == "set_matrix")
         self._set_row_visible(self.auto_row, atype == "auto_keypoints")
+        self._set_row_visible(self.prop_row, atype == "propagation_map")
         self._set_row_visible(self.save_row, atype in ("save_image", "save_stack"))
         # Headless detector params only relevant when the dialog is OFF.
         if atype == "auto_keypoints":
@@ -444,6 +694,8 @@ class BatchModePanel(QWidget):
             self.save_folder_edit.setVisible(use_folder)
             self.save_folder_btn.setVisible(use_folder)
             self.save_suffix_edit.setVisible(use_folder)
+            # Propagation preset only applies to save_stack.
+            self.save_preset_combo.setVisible(atype == "save_stack")
 
     def _browse_save_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -481,11 +733,26 @@ class BatchModePanel(QWidget):
                     "distortion_model": (self.ak_distortion_model.currentText()
                                          if self.ak_use_distortion.isChecked() else None),
                 })
+        elif atype == "propagation_map":
+            action = {
+                "type": "propagation_map",
+                "preset": self.pm_preset.text().strip() or "focus",
+                "metric": self.pm_metric.currentText(),
+                "optics": self._pm_optics(),
+                "center_tpl_um": self.pm_center_tpl.value(),
+                "step_tpl_nm": self.pm_step_tpl.value(),
+                "half_tpl_um": self.pm_half_tpl.value(),
+                "center_mov_um": self.pm_center_mov.value(),
+                "step_mov_nm": self.pm_step_mov.value(),
+                "half_mov_um": self.pm_half_mov.value(),
+            }
         elif atype in ("save_image", "save_stack"):
             action = {"type": atype}
             if self.save_use_folder.isChecked() and self.save_folder_edit.text().strip():
                 action["folder"] = self.save_folder_edit.text().strip()
                 action["suffix"] = self.save_suffix_edit.text().strip()
+            if atype == "save_stack" and self.save_preset_combo.currentData():
+                action["focus_preset"] = self.save_preset_combo.currentData()
         else:
             action = {"type": atype}
         actions.append(action)
@@ -581,6 +848,8 @@ class BatchModePanel(QWidget):
                 )
         elif t == "cross_correlation":
             a.optimize_phase_correlation()
+        elif t == "propagation_map":
+            self._exec_propagation_map(action)
         elif t == "reset":
             a.transform_controls.reset_transform()
         elif t == "save_image":
@@ -590,11 +859,179 @@ class BatchModePanel(QWidget):
             else:
                 a.export_image()
         elif t == "save_stack":
+            self._exec_save_stack(action)
+
+    def _exec_save_stack(self, action):
+        """Save the current moving stack; propagate (template+moving) first when a
+        focus preset is attached, else the plain transform/distort save."""
+        a = self.aligner
+        mov = self._current_moving_path()
+        preset_name = action.get("focus_preset")
+        preset = self.focus_presets.get(preset_name) if preset_name else None
+        if preset is not None:
             folder = action.get("folder")
-            if folder:
-                a.export_stack_to_folder(self._current_moving_path(), folder, action.get("suffix", ""))
-            else:
-                a.export_stack_from_path(self._current_moving_path())
+            if not folder:
+                folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+                if not folder:
+                    return
+            seq = self._current_sequence()
+            a.export_propagated_stack_to_folder(
+                mov, folder, action.get("suffix", ""),
+                optics=preset.get("optics", DEFAULT_OPTICS),
+                z_tpl_um=preset.get("z_tpl_um", 0.0),
+                z_mov_um=preset.get("z_mov_um", 0.0),
+                template_path=seq["template_path"] if seq else None,
+                save_template=True,
+            )
+            return
+        folder = action.get("folder")
+        if folder:
+            a.export_stack_to_folder(mov, folder, action.get("suffix", ""))
+        else:
+            a.export_stack_from_path(mov)
+
+    def _exec_propagation_map(self, action):
+        """Compute the 2-D propagation/co-focus map for the current template +
+        moving cell, show it in a separate window, and let the user store the
+        optimum as a named preset via 'Use optimal'."""
+        self._sync_model_from_table()
+        seq = self._current_sequence()
+        if seq is None:
+            return
+        tpl_path, mov_path = seq["template_path"], self._current_moving_path()
+        if not tpl_path or not mov_path:
+            QMessageBox.warning(self, "Batch Mode",
+                                "Both a template and a moving image must be set for the map.")
+            return
+        optics = action.get("optics", DEFAULT_OPTICS)
+        try:
+            tpl_field, _ = opt.load_field(tpl_path, 0)
+            mov_field, _ = opt.load_field(mov_path, 0)
+        except Exception as e:
+            QMessageBox.critical(self, "Batch Mode", f"Failed to load wavefronts: {e}")
+            return
+        cam = optics.get("camera_pixel_um", 5.86) * 1e-6
+        lam = optics.get("wavelength_nm", 660.0) * 1e-9
+        n = optics.get("n", 1.0)
+        px_tpl = opt.sample_pixel_size(cam, optics.get("mag_tpl", 20.0))
+        px_mov = opt.sample_pixel_size(cam, optics.get("mag_mov", 10.0))
+        z_tpl = (action.get("center_tpl_um", 0.0) * 1e-6
+                 + opt.focus_z_values(action.get("half_tpl_um", 5.0) * 1e-6,
+                                      action.get("step_tpl_nm", 200.0) * 1e-9))
+        z_mov = (action.get("center_mov_um", 0.0) * 1e-6
+                 + opt.focus_z_values(action.get("half_mov_um", 5.0) * 1e-6,
+                                      action.get("step_mov_nm", 200.0) * 1e-9))
+        metric = action.get("metric", "ncc")
+        tpl_shape = tpl_field.shape
+
+        # Alignment-aware moving transform: scale to template sampling, fit to
+        # the template shape, then apply any prior alignment (current_transform +
+        # distortion) so the map reflects the alignment done earlier. The overlap
+        # + 16px border crop inside focus_consistency_map removes warp edges.
+        align_b = self._build_align_b(optics, tpl_shape)
+
+        # Show the window early so the progress bar is visible during compute.
+        win = self._ensure_focus_window(action, optics)
+        win.show(); win.raise_(); win.activateWindow()
+
+        za, zb, map2d = opt.focus_consistency_map(
+            tpl_field, mov_field, z_tpl, z_mov, lam, lam, px_tpl, px_mov,
+            n=n, metric=metric, align_b=align_b, border=16,
+            progress=win.set_progress)
+
+        # Reference indices for line-constrained optima = nearest grid point to
+        # the current focus centers.
+        ref_col = int(np.argmin(np.abs(za - action.get("center_tpl_um", 0.0) * 1e-6)))
+        ref_row = int(np.argmin(np.abs(zb - action.get("center_mov_um", 0.0) * 1e-6)))
+        win.set_map(za * 1e6, zb * 1e6, map2d, metric, ref_col=ref_col, ref_row=ref_row)
+
+        # Stash context the click-overlay needs.
+        self._map_ctx = {
+            "tpl_field": tpl_field, "mov_field": mov_field,
+            "lam": lam, "n": n, "px_tpl": px_tpl, "px_mov": px_mov,
+            "align_b": align_b, "tpl_path": tpl_path, "mov_path": mov_path,
+        }
+
+    def _build_align_b(self, optics, tpl_shape):
+        """Return a callable mapping a propagated moving field into the template
+        frame using the magnification scale + the aligner's current transform +
+        distortion. Used by the focus map so the NCC reflects prior alignment."""
+        a = self.aligner
+        scale = opt.magnification_scale(optics.get("mag_tpl", 20.0), optics.get("mag_mov", 10.0))
+        gm = a.current_transform.params if a.current_transform is not None else np.eye(3)
+        distortion = a.distortion_transform
+
+        def align_b(field):
+            if abs(scale - 1.0) > 1e-6:
+                from skimage import transform as _tf
+                re = _tf.rescale(field.real, scale, order=1, preserve_range=True)
+                im = _tf.rescale(field.imag, scale, order=1, preserve_range=True)
+                field = re + 1j * im
+            field = self._fit_shape(field, tpl_shape)
+            if a.current_transform is not None or distortion is not None:
+                field = opt.warp_field_with_distortion(field, gm, distortion, tpl_shape)
+            return field
+        return align_b
+
+    def _ensure_focus_window(self, action, optics):
+        preset_name = action.get("preset", "focus")
+
+        def use_optimal(z_tpl_um, z_mov_um):
+            self.focus_presets[preset_name] = {
+                "z_tpl_um": float(z_tpl_um), "z_mov_um": float(z_mov_um),
+                "optics": dict(optics),
+            }
+            self._refresh_preset_combo()
+            self.status_label.setText(
+                f"Preset '{preset_name}': z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm")
+
+        if self.focus_map_window is None:
+            self.focus_map_window = FocusMapWindow(on_use_optimal=use_optimal,
+                                                   on_cell=self._overlay_cell)
+        else:
+            self.focus_map_window._on_use_optimal = use_optimal
+            self.focus_map_window._on_cell = self._overlay_cell
+        return self.focus_map_window
+
+    def _overlay_cell(self, z_tpl_um, z_mov_um):
+        """Live feedback (item 5): overlay template@z_tpl + moving@z_mov in the
+        MAIN window. The moving frame is already aligned via align_b, so it is
+        set as the displayed (transformed) image directly -- no extra warp."""
+        ctx = getattr(self, "_map_ctx", None)
+        if not ctx:
+            return
+        a = self.aligner
+        tpl_prop = opt.propagate_asm(ctx["tpl_field"], z_tpl_um * 1e-6, ctx["lam"], ctx["px_tpl"], n=ctx["n"])
+        mov_prop = opt.propagate_asm(ctx["mov_field"], z_mov_um * 1e-6, ctx["lam"], ctx["px_mov"], n=ctx["n"])
+        mov_aligned = ctx["align_b"](mov_prop)
+        tpl_amp = np.abs(tpl_prop).astype(np.float32)
+        mov_amp = np.abs(mov_aligned).astype(np.float32)
+        # Set state directly so update_display shows the already-aligned moving
+        # without re-applying current_transform.
+        a.template_image = tpl_amp
+        a.template_image_file = ctx["tpl_path"]
+        a.transform_controls.set_template_shape(tpl_amp.shape)
+        a.moving_image = mov_amp
+        a.moving_image_file = ctx["mov_path"]
+        a.transformed_image = mov_amp
+        a.onViewModeChanged("overlay")
+        a.update_display()
+        a.statusBar().showMessage(
+            f"Map overlay: z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm")
+
+    @staticmethod
+    def _fit_shape(field, shape):
+        """Center-crop/edge-pad a complex field to ``shape`` (map comparison)."""
+        H, W = shape
+        h, w = field.shape
+        sy = max(0, (h - H) // 2); sx = max(0, (w - W) // 2)
+        field = field[sy:sy + min(H, h), sx:sx + min(W, w)]
+        h, w = field.shape
+        if (h, w) != (H, W):
+            pad = ((max(0, (H - h) // 2), max(0, H - h - (H - h) // 2)),
+                   (max(0, (W - w) // 2), max(0, W - w - (W - w) // 2)))
+            field = np.pad(field, pad, mode="edge")[:H, :W]
+        return field
 
     def _next_action(self):
         actions = self._current_actions()
@@ -695,6 +1132,7 @@ class BatchModePanel(QWidget):
                     "version": 2,
                     "sequences": self.sequences,
                     "column_actions": self.column_actions,
+                    "focus_presets": self.focus_presets,
                 }, f, indent=2)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save config: {e}")
@@ -729,6 +1167,8 @@ class BatchModePanel(QWidget):
             first = sequences[0].get("actions", []) if sequences else []
             self.column_actions = [list(first)]
 
+        self.focus_presets = dict(data.get("focus_presets", {}))
+
         n_mov_cols = max((len(s["moving_paths"]) for s in self.sequences), default=1)
         self._ensure_columns(max(n_mov_cols, len(self.column_actions), 1))
 
@@ -737,5 +1177,6 @@ class BatchModePanel(QWidget):
         self._rebuild_table_from_model()
         self.table.setCurrentCell(0, 1)
         self._populate_action_editor()
+        self._refresh_preset_combo()
         self._update_status()
         self.status_label.setText(f"Loaded config from {Path(path).name}")

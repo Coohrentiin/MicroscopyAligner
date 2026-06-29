@@ -17,7 +17,11 @@ from transformControls import TransformControls
 from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints, estimate_constrained_transform
 from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection, detect_keypoint_pairs
 from utils_images import load_imgfile, load_wavefront_tif, save_stack
-from optics import estimate_scale_translation, estimate_distortion
+from optics import (
+    estimate_scale_translation, estimate_distortion,
+    field_from_phase_amp, phase_amp_from_field, propagate_asm,
+    sample_pixel_size, warp_field_with_distortion, unwrapped_phase,
+)
 
 from skimage.registration import phase_cross_correlation
 import cv2
@@ -25,6 +29,438 @@ import matplotlib.pyplot as plt
 
 # Matplotlib colormaps
 available_colormaps = ["gray", "red", "green", "blue", "cyan", "magenta"] + plt.colormaps()
+
+
+class AlignerDistanceController:
+    """Adapts :class:`ImageAligner` to the :class:`DistanceDialog` controller API
+    so the same dialog can drive either the main window or another panel.
+
+    A controller exposes: ``parent_widget``, ``targets()``, ``optics()``,
+    ``magnification(target)``, ``set_optics(target, mag, wl, px, n)``,
+    ``current_z(target)``, ``set_distance(target, z_um)``, ``reset(target)``,
+    ``both_wavefronts()``, ``fields()`` -> (template_field, moving_field),
+    ``align_b()`` -> callable, ``pixel_sizes()`` -> (px_tpl, px_mov, lam, n),
+    ``apply_optimal(z_tpl_um, z_mov_um)`` and ``overlay_cell(z_tpl_um, z_mov_um,
+    align_b)``.
+    """
+
+    def __init__(self, aligner):
+        self.a = aligner
+        self.parent_widget = aligner
+
+    def targets(self):
+        out = []
+        if self.a.moving_field is not None:
+            out.append("moving")
+        if self.a.template_field is not None:
+            out.append("template")
+        return out
+
+    def optics(self):
+        return self.a.propagation_optics
+
+    def magnification(self, target):
+        o = self.a.propagation_optics
+        return o["mag_tpl"] if target == "template" else o["mag_mov"]
+
+    def set_optics(self, target, mag, wl, px, n):
+        o = self.a.propagation_optics
+        o["mag_tpl" if target == "template" else "mag_mov"] = mag
+        o.update({"wavelength_nm": wl, "camera_pixel_um": px, "n": n})
+
+    def current_z(self, target):
+        return self.a._wf_z(target)
+
+    def set_distance(self, target, z_um, roi_frac=1.0):
+        # Main-window slider re-derives the full image via the aligner's own
+        # (GPU) propagation; roi_frac is a focusing-panel preview concern.
+        self.a.set_propagation_distance(z_um, target=target)
+
+    def reset(self, target, roi_frac=1.0):
+        self.a.reset_propagation(target=target)
+
+    def both_wavefronts(self):
+        return self.a.template_field is not None and self.a.moving_field is not None
+
+    def fields(self, roi_frac=1.0):
+        # Aligner's moving field is raw (different sampling than template), so the
+        # ROI crop is applied inside align_b after rescale+fit; return full fields.
+        return self.a.template_field, self.a.moving_field
+
+    def pixel_sizes(self):
+        o = self.a.propagation_optics
+        cam = o["camera_pixel_um"] * 1e-6
+        return (sample_pixel_size(cam, o["mag_tpl"]), sample_pixel_size(cam, o["mag_mov"]),
+                o["wavelength_nm"] * 1e-9, o["n"])
+
+    def align_b(self, roi_frac=1.0):
+        a = self.a
+        o = a.propagation_optics
+        scale = magnification_scale_safe(o["mag_tpl"], o["mag_mov"])
+        gm = a.current_transform.params if a.current_transform is not None else np.eye(3)
+        distortion = a.distortion_transform
+        tpl_shape = a.template_field.shape
+
+        def f(field):
+            if abs(scale - 1.0) > 1e-6:
+                field = (tf.rescale(field.real, scale, order=1, preserve_range=True)
+                         + 1j * tf.rescale(field.imag, scale, order=1, preserve_range=True))
+            field = DistanceDialog._fit_shape(field, tpl_shape)
+            if a.current_transform is not None or distortion is not None:
+                field = warp_field_with_distortion(field, gm, distortion, tpl_shape)
+            return field
+        return f
+
+    def apply_optimal(self, z_tpl_um, z_mov_um):
+        self.a.set_propagation_distance(z_tpl_um, target="template")
+        self.a.set_propagation_distance(z_mov_um, target="moving")
+
+    def overlay_cell(self, z_tpl_um, z_mov_um, align_b):
+        # Pure display preview (does NOT mutate the aligner's raw fields/transform,
+        # so 'Use optimal' still propagates from the raw fields). Renders the
+        # aligner's chosen observable so a click shows phase immediately.
+        a = self.a
+        px_tpl, px_mov, lam, n = self.pixel_sizes()
+        tpl = propagate_asm(a.template_field, z_tpl_um * 1e-6, lam, px_tpl, n=n)
+        mov = align_b(propagate_asm(a.moving_field, z_mov_um * 1e-6, lam, px_mov, n=n))
+        a.template_image = a._observable_image(tpl, "template")
+        a.transform_controls.set_template_shape(a.template_image.shape)
+        a.moving_image = a._observable_image(mov, "moving")
+        a.transformed_image = a.moving_image
+        a.onViewModeChanged("overlay"); a.update_display()
+
+
+def magnification_scale_safe(mag_tpl, mag_mov):
+    from optics import magnification_scale
+    return magnification_scale(mag_tpl, mag_mov)
+
+
+class DistanceDialog(QDialog):
+    """Change-distance dialog: target (template/moving) + optics + a live slider.
+
+    Drives a *controller* (default :class:`AlignerDistanceController`) so the
+    SAME dialog can change propagation in the main window or in another panel
+    (e.g. the Focusing tool's manual-refocus step). Each change re-propagates
+    the raw field and re-derives that image; 'Reset to 0' reloads that file.
+    """
+
+    Z_STEPS = 500  # slider ticks across +/- half-range
+
+    def __init__(self, controller):
+        # Accept either a controller or a bare ImageAligner (back-compat).
+        if not hasattr(controller, "targets"):
+            controller = AlignerDistanceController(controller)
+        self.ctrl = controller
+        super().__init__(controller.parent_widget)
+        self.setWindowTitle("Change Propagation Distance")
+        self.setModal(False)
+        v = QVBoxLayout(self)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Target:"))
+        self.target = QComboBox()
+        for t in self.ctrl.targets():
+            self.target.addItem(t)
+        self.target.currentTextChanged.connect(self._on_target_changed)
+        target_row.addWidget(self.target)
+        v.addLayout(target_row)
+
+        o = self.ctrl.optics()
+        opt_row = QHBoxLayout()
+        self.mag = self._spin(o["mag_mov"], " mag×", 0.1, 200)
+        self.wl = self._spin(o["wavelength_nm"], " nm", 100, 2000)
+        self.px = self._spin(o["camera_pixel_um"], " µm px", 0.1, 100, 0.01, 3)
+        self.n = self._spin(o["n"], " n", 1.0, 2.0, 0.001, 3)
+        for w in (self.mag, self.wl, self.px, self.n):
+            opt_row.addWidget(w)
+        v.addLayout(opt_row)
+
+        rng_row = QHBoxLayout()
+        rng_row.addWidget(QLabel("Half-range (µm):"))
+        self.half = QDoubleSpinBox(); self.half.setRange(0.1, 500); self.half.setValue(20.0)
+        self.half.valueChanged.connect(self._update_label)
+        rng_row.addWidget(self.half)
+        # Central-ROI fraction: the focus search (slider preview + 2-D map) runs
+        # on this centered crop for speed; the chosen z is applied full-frame.
+        rng_row.addWidget(QLabel("Focus ROI %:"))
+        self.roi_pct = QSpinBox(); self.roi_pct.setRange(5, 100); self.roi_pct.setValue(25)
+        self.roi_pct.setToolTip("Centered crop used for the focus search; z is applied to the full frame.")
+        rng_row.addWidget(self.roi_pct)
+        v.addLayout(rng_row)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(-self.Z_STEPS, self.Z_STEPS)
+        self.slider.valueChanged.connect(self._on_slider)
+        v.addWidget(self.slider)
+
+        self.z_label = QLabel(); self.z_label.setStyleSheet("font-weight: bold;")
+        v.addWidget(self.z_label)
+
+        # --- 2D propagation map (co-focus of template vs moving) ---
+        map_box = QGroupBox("2D propagation map (template vs moving co-focus)")
+        mv = QVBoxLayout(map_box)
+        mrow = QHBoxLayout()
+        self.map_half_tpl = self._spin(5.0, " ±tplµm", 0.1, 200)
+        self.map_step_tpl = self._spin(200.0, " tpl nm", 10, 5000)
+        self.map_half_mov = self._spin(5.0, " ±movµm", 0.1, 200)
+        self.map_step_mov = self._spin(200.0, " mov nm", 10, 5000)
+        self.map_metric = QComboBox(); self.map_metric.addItems(["ncc", "l2", "ssim"])
+        for w in (self.map_half_tpl, self.map_step_tpl, self.map_half_mov, self.map_step_mov, self.map_metric):
+            mrow.addWidget(w)
+        mv.addLayout(mrow)
+        self.map_btn = QPushButton("Compute 2D Map")
+        self.map_btn.setStyleSheet("QPushButton { background-color: #2196F3; }")
+        self.map_btn.clicked.connect(self._compute_map)
+        mv.addWidget(self.map_btn)
+        map_hint = QLabel("Needs BOTH images to be wavefronts. The map window has "
+                          "focal-point modes, go-to-optimal, click→overlay; 'Use optimal' "
+                          "applies the distances to both targets.")
+        map_hint.setStyleSheet("color: gray;"); map_hint.setWordWrap(True)
+        mv.addWidget(map_hint)
+        # Disable if either image is not a wavefront.
+        if not self.ctrl.both_wavefronts():
+            map_box.setEnabled(False)
+            map_box.setToolTip("Both template and moving must be wavefronts.")
+        v.addWidget(map_box)
+
+        btns = QHBoxLayout()
+        reset = QPushButton("Reset to 0 (reload file)")
+        reset.clicked.connect(self._reset)
+        close = QPushButton("Close"); close.clicked.connect(self.accept)
+        btns.addWidget(reset); btns.addStretch(); btns.addWidget(close)
+        v.addLayout(btns)
+        self._focus_map_window = None
+        self._on_target_changed(self.target.currentText())
+
+    @staticmethod
+    def _spin(val, suffix, lo, hi, step=None, decimals=2):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(decimals)
+        s.setValue(val); s.setSuffix(suffix)
+        if step is not None:
+            s.setSingleStep(step)
+        return s
+
+    def _tgt(self):
+        return self.target.currentText() or "moving"
+
+    def _on_target_changed(self, _text):
+        # Load the selected target's magnification + current distance into the UI.
+        tgt = self._tgt()
+        if not tgt:
+            return
+        self.mag.blockSignals(True)
+        self.mag.setValue(self.ctrl.magnification(tgt))
+        self.mag.blockSignals(False)
+        cur = self.ctrl.current_z(tgt)
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(round(cur / max(self.half.value(), 1e-9) * self.Z_STEPS)))
+        self.slider.blockSignals(False)
+        self._update_label()
+        # Optional: let the controller refresh any live preview for this target.
+        if hasattr(self.ctrl, "on_target_shown"):
+            self.ctrl.on_target_shown(tgt, roi_frac=self._roi_frac())
+
+    def _z_um(self):
+        return self.slider.value() / self.Z_STEPS * self.half.value()
+
+    def _push_optics(self):
+        self.ctrl.set_optics(self._tgt(), self.mag.value(), self.wl.value(),
+                             self.px.value(), self.n.value())
+
+    def _roi_frac(self):
+        return self.roi_pct.value() / 100.0
+
+    def _on_slider(self, _v):
+        self._push_optics()
+        self.ctrl.set_distance(self._tgt(), self._z_um(), roi_frac=self._roi_frac())
+        self._update_label()
+
+    def _update_label(self):
+        roi = self._roi_frac()
+        roi_txt = "" if roi >= 1.0 else f"  ·  preview on central {roi * 100:g}% ROI"
+        self.z_label.setText(f"{self._tgt()} distance: {self._z_um():.3f} µm{roi_txt}")
+
+    def _reset(self):
+        self.slider.blockSignals(True); self.slider.setValue(0); self.slider.blockSignals(False)
+        self.ctrl.reset(self._tgt(), roi_frac=self._roi_frac())
+        self._update_label()
+
+    def _compute_map(self):
+        """Compute the 2-D template-vs-moving co-focus map and show the shared
+        FocusMapWindow (modes / go-to-optimal / click-overlay / progress)."""
+        if not self.ctrl.both_wavefronts():
+            QMessageBox.warning(self, "2D Map", "Both template and moving must be wavefronts.")
+            return
+        self._push_optics()
+        from batchMode import FocusMapWindow
+        import optics as o
+        roi_frac = self.roi_pct.value() / 100.0
+        tpl_field, mov_field = self.ctrl.fields(roi_frac)
+        px_tpl, px_mov, lam, n = self.ctrl.pixel_sizes()
+        align_b = self.ctrl.align_b(roi_frac)
+        # On-cell live overlay uses the FULL fields (z applied to whole frame).
+        overlay_align_b = self.ctrl.align_b(1.0)
+        cur_tpl, cur_mov = self.ctrl.current_z("template"), self.ctrl.current_z("moving")
+        z_tpl = cur_tpl * 1e-6 + o.focus_z_values(
+            self.map_half_tpl.value() * 1e-6, self.map_step_tpl.value() * 1e-9)
+        z_mov = cur_mov * 1e-6 + o.focus_z_values(
+            self.map_half_mov.value() * 1e-6, self.map_step_mov.value() * 1e-9)
+        metric = self.map_metric.currentText()
+
+        def use_optimal(z_tpl_um, z_mov_um):
+            self.ctrl.apply_optimal(z_tpl_um, z_mov_um)
+            self._on_target_changed(self.target.currentText())
+
+        def on_cell(z_tpl_um, z_mov_um):
+            self.ctrl.overlay_cell(z_tpl_um, z_mov_um, overlay_align_b)
+
+        if self._focus_map_window is None:
+            self._focus_map_window = FocusMapWindow(on_use_optimal=use_optimal, on_cell=on_cell)
+        else:
+            self._focus_map_window._on_use_optimal = use_optimal
+            self._focus_map_window._on_cell = on_cell
+        win = self._focus_map_window
+        win.show(); win.raise_(); win.activateWindow()
+
+        za, zb, map2d = o.focus_consistency_map(
+            tpl_field, mov_field, z_tpl, z_mov, lam, lam, px_tpl, px_mov,
+            n=n, metric=metric, align_b=align_b, border=16, progress=win.set_progress)
+        ref_col = int(np.argmin(np.abs(za - cur_tpl * 1e-6)))
+        ref_row = int(np.argmin(np.abs(zb - cur_mov * 1e-6)))
+        win.set_map(za * 1e6, zb * 1e6, map2d, metric, ref_col=ref_col, ref_row=ref_row)
+
+    @staticmethod
+    def _fit_shape(field, shape):
+        """Center-crop/edge-pad a complex field to ``shape`` (map comparison)."""
+        H, W = shape
+        h, w = field.shape
+        sy = max(0, (h - H) // 2); sx = max(0, (w - W) // 2)
+        field = field[sy:sy + min(H, h), sx:sx + min(W, w)]
+        h, w = field.shape
+        if (h, w) != (H, W):
+            pad = ((max(0, (H - h) // 2), max(0, H - h - (H - h) // 2)),
+                   (max(0, (W - w) // 2), max(0, W - w - (W - w) // 2)))
+            field = np.pad(field, pad, mode="edge")[:H, :W]
+        return field
+
+
+class DistortionFitDialog(QDialog):
+    """Fit-quality popup for an estimated distortion: numeric metrics, a
+    deformation-grid figure with the keypoint pairs (origin->destination), a
+    before/after image-correlation sanity check, and a Cancel button to discard
+    the estimate (#2a/#2c/#2d)."""
+
+    def __init__(self, parent, distortion_tf, pairs, shape, model,
+                 residual_matrix=None, corr_before=None, corr_after=None,
+                 on_cancel=None, params=None):
+        super().__init__(parent)
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        import optics as o
+        self._on_cancel = on_cancel
+        self.setWindowTitle(f"Distortion fit quality — {model}")
+        self.resize(600, 700)
+        v = QVBoxLayout(self)
+
+        q = o.distortion_fit_quality(distortion_tf, pairs, residual_matrix=residual_matrix)
+        lines = [f"<b>Model:</b> {model}",
+                 f"<b>Pairs:</b> {q['n']}",
+                 f"<b>Residual RMS:</b> {q['rms']:.3f} px",
+                 f"<b>Max residual:</b> {q['max_err']:.3f} px",
+                 f"<b>R² (displacement explained):</b> {q['r2'] * 100:.1f}%"]
+        # Detection parameters used to obtain the pairs (#2).
+        if params:
+            order = [("detector", "Detector"), ("matcher", "Matcher"),
+                     ("distance_ratio", "Distance ratio"), ("ransac_threshold", "RANSAC px"),
+                     ("border_crop", "Border crop px"), ("max_features", "Max features")]
+            pstr = "  ·  ".join(f"{label}: {params[key]}" for key, label in order if key in params)
+            if pstr:
+                lines.append(f"<b>Keypoints:</b> {pstr}")
+        if "k" in q:
+            lines.append(f"<b>Curvature k:</b> {q['k']:.3e} px⁻²")
+        if q.get("effective_radius_px") not in (None, float("inf")):
+            lines.append(f"<b>Eff. radius:</b> {q['effective_radius_px']:.0f} px")
+        quality = ("Excellent" if q["rms"] < 1 else "Good" if q["rms"] < 3
+                   else "Fair" if q["rms"] < 8 else "Poor")
+        lines.append(f"<b>Residual assessment:</b> {quality}")
+        # Image-correlation sanity check (#2c).
+        if corr_before is not None and corr_after is not None:
+            delta = corr_after - corr_before
+            verdict = "improved" if delta > 1e-3 else ("no change" if abs(delta) <= 1e-3 else "WORSE")
+            color = "#2e7d32" if delta > 1e-3 else ("#888" if abs(delta) <= 1e-3 else "#c62828")
+            lines.append(f"<b>Image NCC:</b> before {corr_before:.4f} → after {corr_after:.4f} "
+                         f"<span style='color:{color}'>({verdict})</span>")
+            if delta < -1e-3:
+                lines.append("<span style='color:#c62828'>Correction lowers correlation — "
+                             "likely a bad estimate; consider Cancel.</span>")
+        lbl = QLabel("<br>".join(lines))
+        lbl.setTextFormat(Qt.RichText); lbl.setWordWrap(True)
+        v.addWidget(lbl)
+
+        fig = Figure(figsize=(5, 4), tight_layout=True)
+        canvas = FigureCanvasQTAgg(fig)
+        ax = fig.add_subplot(111)
+        gx, gy, dx, dy = o.deformation_grid(distortion_tf, shape, n=16)
+        for r in range(dx.shape[0]):
+            ax.plot(dx[r, :], dy[r, :], color="#1f77b4", lw=0.6)
+        for c in range(dx.shape[1]):
+            ax.plot(dx[:, c], dy[:, c], color="#1f77b4", lw=0.6)
+        ax.quiver(gx, gy, dx - gx, dy - gy, angles="xy", scale_units="xy",
+                  scale=1, color="#d62728", width=0.003, label="grid deformation")
+        # Keypoint pairs: template (origin) -> moving (destination) (#2a).
+        if pairs:
+            tp = np.asarray([p[0] for p in pairs], dtype=float)
+            mp = np.asarray([p[1] for p in pairs], dtype=float)
+            ax.scatter(tp[:, 0], tp[:, 1], s=10, c="#2e7d32", marker="o", label="template pt")
+            ax.scatter(mp[:, 0], mp[:, 1], s=10, c="#ff9800", marker="x", label="moving pt")
+            ax.quiver(tp[:, 0], tp[:, 1], mp[:, 0] - tp[:, 0], mp[:, 1] - tp[:, 1],
+                      angles="xy", scale_units="xy", scale=1, color="#9c27b0",
+                      width=0.002, alpha=0.6)
+        ax.set_title("Deformation grid + keypoint pairs (template→moving)", fontsize=9)
+        ax.set_xlim(0, shape[1]); ax.set_ylim(shape[0], 0)
+        ax.set_aspect("equal"); ax.tick_params(labelsize=6)
+        ax.legend(loc="upper right", fontsize=6, framealpha=0.6)
+        v.addWidget(canvas, stretch=1)
+
+        btns = QHBoxLayout(); btns.addStretch()
+        if on_cancel is not None:
+            cancel = QPushButton("Cancel (discard correction)")
+            cancel.setStyleSheet("QPushButton { background-color: #c62828; }")
+            cancel.clicked.connect(self._cancel)
+            btns.addWidget(cancel)
+        close = QPushButton("Close (keep)"); close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        v.addLayout(btns)
+
+    def _cancel(self):
+        if self._on_cancel is not None:
+            self._on_cancel()
+        self.reject()
+
+
+def show_distortion_fit_quality(parent, distortion_tf, pairs, shape, model,
+                                residual_matrix=None, corr_before=None,
+                                corr_after=None, on_cancel=None, params=None,
+                                modal=False):
+    """Show the distortion fit-quality popup (best-effort; never raises).
+
+    ``modal`` blocks (``exec``) until the user clicks Close or Cancel -- used
+    during a sequence Run so the next step waits for the user's decision."""
+    try:
+        dlg = DistortionFitDialog(parent, distortion_tf, pairs, shape, model,
+                                  residual_matrix=residual_matrix,
+                                  corr_before=corr_before, corr_after=corr_after,
+                                  on_cancel=on_cancel, params=params)
+        parent._distortion_fit_dialog = dlg  # keep a ref so it isn't GC'd
+        if modal:
+            dlg.setModal(True)
+            dlg.exec()
+        else:
+            dlg.show()
+    except Exception as e:
+        print(f"Distortion fit-quality popup failed: {e}")
+
+
 class ImageAligner(QMainWindow):
     """Main application window"""
     
@@ -38,6 +474,23 @@ class ImageAligner(QMainWindow):
         # Optional non-rigid distortion warp (template->moving) applied on top of
         # current_transform, e.g. from the keypoint dialog's distortion option.
         self.distortion_transform = None
+        # Raw WAVEFRONTS (complex) + per-target propagation state. When a loaded
+        # file is a 2-channel wavefront, that image is DERIVED from
+        # propagate(field, z) via the chosen observable; changing z re-derives
+        # the whole field. Both template and moving can be wavefronts. None for
+        # plain (non-wavefront) images.
+        self.moving_field = None
+        self.moving_field_file = None
+        self.moving_z_um = 0.0
+        self.moving_observable = "amplitude"  # real / imaginary / amplitude / phase
+        self.template_field = None
+        self.template_field_file = None
+        self.template_z_um = 0.0
+        self.template_observable = "amplitude"
+        self.propagation_optics = {
+            "mag_tpl": 20.0, "na_tpl": 0.8, "mag_mov": 10.0, "na_mov": 0.45,
+            "wavelength_nm": 660.0, "camera_pixel_um": 5.86, "n": 1.0,
+        }
         self.optimizer_dialog_open = False
         self.keypoints_dialog = None
         self.auto_keypoints_dialog = None
@@ -135,12 +588,42 @@ class ImageAligner(QMainWindow):
         self.transform_controls = TransformControls()
         self.transform_controls.transform_changed.connect(self.apply_transform)
 
+        # Wavefront / propagation controls (active for wavefront images). The
+        # target combo selects whether the observable / distance apply to the
+        # template or the moving wavefront.
+        wf_group = QGroupBox("Wavefront")
+        wf_layout = QVBoxLayout()
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Target:"))
+        self.wf_target_combo = QComboBox()
+        self.wf_target_combo.addItems(["moving", "template"])
+        self.wf_target_combo.currentTextChanged.connect(self._on_wf_target_changed)
+        target_row.addWidget(self.wf_target_combo)
+        wf_layout.addLayout(target_row)
+        obs_row = QHBoxLayout()
+        obs_row.addWidget(QLabel("Observable:"))
+        self.observable_combo = QComboBox()
+        self.observable_combo.addItems(["amplitude", "phase", "real", "imaginary"])
+        self.observable_combo.currentTextChanged.connect(self._on_observable_changed)
+        obs_row.addWidget(self.observable_combo)
+        wf_layout.addLayout(obs_row)
+        self.distance_label = QLabel("Propagation (moving): 0.000 µm")
+        self.distance_label.setStyleSheet("color: gray;")
+        wf_layout.addWidget(self.distance_label)
+        reset_dist_btn = QPushButton("Reset distance (reload file)")
+        reset_dist_btn.clicked.connect(lambda: self.reset_propagation(self._wf_target()))
+        wf_layout.addWidget(reset_dist_btn)
+        remove_dist_btn = QPushButton("Remove distortion")
+        remove_dist_btn.clicked.connect(self.remove_distortion)
+        wf_layout.addWidget(remove_dist_btn)
+        wf_group.setLayout(wf_layout)
+
         # Optimization controls
         opt_group = QGroupBox("Optimization")
         opt_layout = QVBoxLayout()
-        
+
         self.opt_method = QComboBox()
-        self.opt_method.addItems(["Manual Pairs of Points", "Auto Detect Keypoints", "Phase Cross-Correlation", "Brute Force"]) #["Manual Pairs of Points","Phase Cross-Correlation", "Brute Force", "Enhanced Correlation"]
+        self.opt_method.addItems(["Manual Pairs of Points", "Auto Detect Keypoints", "Phase Cross-Correlation", "Brute Force", "Distortion Correction", "Change Distance"])
         
         optimize_btn = QPushButton("Optimize Alignment")
         optimize_btn.setStyleSheet("QPushButton { background-color: #2196F3; }")
@@ -174,6 +657,7 @@ class ImageAligner(QMainWindow):
         export_group.setLayout(export_layout)
         
         right_layout.addWidget(self.transform_controls)
+        right_layout.addWidget(wf_group)
         right_layout.addWidget(opt_group)
         right_layout.addWidget(export_group)
         right_layout.addStretch()
@@ -245,9 +729,27 @@ class ImageAligner(QMainWindow):
             self.load_template_from_path(file_path)
 
     def load_template_from_path(self, file_path):
-        """Load template (reference) image from an explicit path (no dialog)."""
-        self.set_template_array(load_imgfile(file_path).astype(np.float32), file_path)
-        self.statusBar().showMessage(f"Loaded template: {Path(file_path).name}")
+        """Load template (reference) image from an explicit path (no dialog).
+
+        Like the moving loader, keeps the raw complex field when the file is a
+        2-channel wavefront so the template can also be re-propagated."""
+        self.template_field = None
+        self.template_field_file = None
+        self.template_z_um = 0.0
+        try:
+            phase, amp, _n = load_wavefront_tif(file_path, frame_index=0)
+            self.template_field = field_from_phase_amp(phase, amp)
+            self.template_field_file = file_path
+        except Exception:
+            self.template_field = None
+        if self.template_field is not None:
+            self.set_template_array(self._observable_image(self.template_field, "template"), file_path)
+            self.statusBar().showMessage(
+                f"Loaded template wavefront: {Path(file_path).name} (propagation enabled)")
+        else:
+            self.set_template_array(load_imgfile(file_path).astype(np.float32), file_path)
+            self.statusBar().showMessage(f"Loaded template: {Path(file_path).name}")
+        self._update_distance_label()
 
     def set_template_array(self, arr, source_path):
         """Set the template (reference) image from an in-memory array (no file
@@ -274,9 +776,144 @@ class ImageAligner(QMainWindow):
             self.load_moving_from_path(file_path)
 
     def load_moving_from_path(self, file_path):
-        """Load moving image from an explicit path (no dialog)."""
-        self.set_moving_array(load_imgfile(file_path).astype(np.float32), file_path)
-        self.statusBar().showMessage(f"Loaded moving image: {Path(file_path).name}")
+        """Load moving image from an explicit path (no dialog).
+
+        If the file is a 2-channel wavefront, keep the raw complex field so the
+        propagation distance can be changed later (the moving image is then
+        derived from ``propagate(field, z)`` via the chosen observable). Plain
+        images load as before with no propagation.
+        """
+        self.moving_field = None
+        self.moving_field_file = None
+        self.moving_z_um = 0.0
+        try:
+            phase, amp, _n = load_wavefront_tif(file_path, frame_index=0)
+            self.moving_field = field_from_phase_amp(phase, amp)
+            self.moving_field_file = file_path
+        except Exception:
+            self.moving_field = None  # not a wavefront -> plain image path
+        self._update_distance_label()
+        if self.moving_field is not None:
+            self.set_moving_array(self._observable_image(self.moving_field, "moving"), file_path)
+            self.statusBar().showMessage(
+                f"Loaded moving wavefront: {Path(file_path).name} (propagation enabled)")
+        else:
+            self.set_moving_array(load_imgfile(file_path).astype(np.float32), file_path)
+            self.statusBar().showMessage(f"Loaded moving image: {Path(file_path).name}")
+
+    # ---- per-target wavefront/propagation helpers (target in {template, moving}) ----
+    def _wf_field(self, target):
+        return self.template_field if target == "template" else self.moving_field
+
+    def _wf_observable(self, target):
+        return self.template_observable if target == "template" else self.moving_observable
+
+    def _wf_z(self, target):
+        return self.template_z_um if target == "template" else self.moving_z_um
+
+    def _observable_image(self, field, target):
+        """2-D real view of a complex field per the target's observable."""
+        obs = self._wf_observable(target)
+        if obs == "phase":
+            return unwrapped_phase(field).astype(np.float32)
+        if obs == "real":
+            return np.real(field).astype(np.float32)
+        if obs == "imaginary":
+            return np.imag(field).astype(np.float32)
+        return np.abs(field).astype(np.float32)  # amplitude (default)
+
+    def _propagated_field(self, target):
+        """The raw field for ``target`` propagated to its current distance, or None."""
+        field = self._wf_field(target)
+        if field is None:
+            return None
+        o = self.propagation_optics
+        mag = o["mag_tpl"] if target == "template" else o["mag_mov"]
+        px = sample_pixel_size(o["camera_pixel_um"] * 1e-6, mag)
+        lam = o["wavelength_nm"] * 1e-9
+        return propagate_asm(field, self._wf_z(target) * 1e-6, lam, px, n=o["n"])
+
+    def _recompute_from_field(self, target):
+        """Re-derive the target's displayed image from its propagated field +
+        observable, keeping the current transform."""
+        field = self._propagated_field(target)
+        if field is None:
+            return
+        if target == "template":
+            self.set_template_array(self._observable_image(field, "template"), self.template_field_file)
+            # Template shape may matter for the transform; re-apply on the moving.
+            if self.current_transform is not None and self.moving_image is not None:
+                self.apply_transform(self.transform_controls.transform_params)
+        else:
+            self.set_moving_array(self._observable_image(field, "moving"), self.moving_field_file)
+        self._update_distance_label()
+
+    def _update_distance_label(self):
+        target = self._wf_target()
+        field = self._wf_field(target)
+        if field is None:
+            self.distance_label.setText(f"Propagation ({target}): n/a (not a wavefront)")
+        else:
+            self.distance_label.setText(f"Propagation ({target}): {self._wf_z(target):.3f} µm")
+
+    def _wf_target(self):
+        """Currently selected wavefront target in the panel (template/moving)."""
+        return self.wf_target_combo.currentText() if hasattr(self, "wf_target_combo") else "moving"
+
+    def _on_wf_target_changed(self, _text):
+        # Reflect the selected target's observable + distance in the panel.
+        target = self._wf_target()
+        obs = self._wf_observable(target)
+        self.observable_combo.blockSignals(True)
+        self.observable_combo.setCurrentText(obs)
+        self.observable_combo.blockSignals(False)
+        self._update_distance_label()
+
+    def _on_observable_changed(self, _text):
+        target = self._wf_target()
+        obs = self.observable_combo.currentText()
+        if target == "template":
+            self.template_observable = obs
+        else:
+            self.moving_observable = obs
+        if self._wf_field(target) is not None:
+            self._recompute_from_field(target)
+
+    def set_propagation_distance(self, z_um, target="moving"):
+        """Set the propagation distance (µm) for ``target`` and re-derive it.
+
+        Changes the entire wavefront the transform acts on (moving) or the
+        reference frame (template)."""
+        if self._wf_field(target) is None:
+            QMessageBox.warning(self, "Propagation",
+                                f"The {target} image is not a wavefront; propagation is disabled.")
+            return
+        if target == "template":
+            self.template_z_um = float(z_um)
+        else:
+            self.moving_z_um = float(z_um)
+        self._recompute_from_field(target)
+        self.statusBar().showMessage(f"Propagation distance ({target}): {self._wf_z(target):.3f} µm")
+
+    def reset_propagation(self, target="moving"):
+        """Reset the target's distance to 0 by reloading its file from disk."""
+        path = self.template_field_file if target == "template" else self.moving_field_file
+        if not path:
+            return
+        if target == "template":
+            self.load_template_from_path(path)
+        else:
+            self.load_moving_from_path(path)
+        self.statusBar().showMessage(f"Propagation ({target}) reset to 0 µm (reloaded).")
+
+    def remove_distortion(self):
+        """Clear any distortion warp (keep the linear transform)."""
+        if self.distortion_transform is None:
+            self.statusBar().showMessage("No distortion to remove.")
+            return
+        self.distortion_transform = None
+        self.apply_transform(self.transform_controls.transform_params)
+        self.statusBar().showMessage("Distortion correction removed.")
 
     def set_moving_array(self, arr, source_path):
         """Set the moving image from an in-memory array (no file read).
@@ -440,11 +1077,64 @@ class ImageAligner(QMainWindow):
         self.auto_keypoints_dialog = None
         self.set_optimizer_dialog_state(False)
 
+    def open_distortion_tool(self):
+        """Distortion-correction method: a keypoint-like dialog that estimates &
+        applies ONLY a residual distortion warp (the linear transform is left
+        as-is). Mirrors the auto-keypoints dialog (point 3)."""
+        if self.template_image is None or self.moving_image is None:
+            QMessageBox.warning(self, "Warning", "Load both images first")
+            return
+        self.set_optimizer_dialog_state(True)
+        self.onViewModeChanged("side_by_side")
+        self.canvas.enable_keypoint_mode(False)
+        moving_for_detection = self.transformed_image if self.transformed_image is not None else self.moving_image
+        self.auto_keypoints_dialog = KeyPointsDetectionAndSelection(
+            self, self.template_image, moving_for_detection)
+        # This tool is specifically about distortion -> default it ON.
+        self.auto_keypoints_dialog.use_distortion.setChecked(True)
+        self.auto_keypoints_dialog._update_distortion_enabled(True)
+        self.statusBar().showMessage("Detect keypoints, then apply distortion correction.")
+        self.auto_keypoints_dialog.show()
+        result = self.auto_keypoints_dialog.exec()
+        if result == QDialog.Accepted:
+            pairs = self.auto_keypoints_dialog.point_pairs
+            self.canvas.clear_keypoints()
+            if len(pairs) >= 3:
+                enabled, model = self.auto_keypoints_dialog.distortion_request()
+                # Keypoints were detected on the ALREADY-TRANSFORMED moving image
+                # (``transformed_image``), so the moving points are ALREADY in the
+                # template frame -> the residual reference is IDENTITY. (Applying
+                # current_transform again here double-counted it and made the
+                # estimated distortion far too strong.)
+                self._estimate_keypoint_distortion(pairs, np.eye(3),
+                                                   model if enabled else "tps", warn=True,
+                                                   show_quality=True)
+                self.onViewModeChanged("overlay")
+                self.apply_transform(self.transform_controls.transform_params)
+                if self.distortion_transform is not None:
+                    self.statusBar().showMessage(
+                        f"Distortion correction applied from {len(pairs)} pairs ({model}).")
+            else:
+                self.statusBar().showMessage(f"Need >= 3 pairs for distortion ({len(pairs)} found).")
+        self.auto_keypoints_dialog = None
+        self.set_optimizer_dialog_state(False)
+
+    def open_distance_tool(self):
+        """Change-distance method: a dialog with a target (template/moving)
+        selector, optics, and a live z slider that re-propagates the chosen
+        wavefront in real time (point 4)."""
+        if self.moving_field is None and self.template_field is None:
+            QMessageBox.warning(self, "Change Distance",
+                                "Neither image is a wavefront; propagation is disabled.")
+            return
+        dialog = DistanceDialog(self)
+        dialog.exec()
+
     def auto_keypoints_headless(self, detector="AKAZE", matcher="Brute Force",
                                 max_features=500, distance_ratio=0.75,
                                 use_ransac=True, ransac_threshold=5.0,
                                 lock_rotation=False, lock_scale=False,
-                                distortion_model=None):
+                                distortion_model=None, border_crop=0):
         """Run automatic keypoint alignment without opening the dialog.
 
         Mirrors the matrix-combination logic of ``open_auto_keypoints_tool`` so
@@ -466,7 +1156,7 @@ class ImageAligner(QMainWindow):
             self.template_image, moving_img_for_detection,
             detector=detector, matcher=matcher, max_features=max_features,
             distance_ratio=distance_ratio, use_ransac=use_ransac,
-            ransac_threshold=ransac_threshold,
+            ransac_threshold=ransac_threshold, border_crop=border_crop,
         )
         if len(pairs) == 0:
             self.statusBar().showMessage("Auto keypoints: no pairs detected (transform unchanged).")
@@ -490,7 +1180,8 @@ class ImageAligner(QMainWindow):
     def auto_keypoints_scale_translation_headless(self, detector="AKAZE",
                                                   matcher="Brute Force",
                                                   max_features=500, distance_ratio=0.75,
-                                                  use_ransac=True, ransac_threshold=5.0):
+                                                  use_ransac=True, ransac_threshold=5.0,
+                                                  border_crop=0):
         """Headless keypoint alignment constrained to scale + translation only.
 
         Mirrors :meth:`auto_keypoints_headless` but estimates an isotropic
@@ -510,7 +1201,7 @@ class ImageAligner(QMainWindow):
             self.template_image, moving_img_for_detection,
             detector=detector, matcher=matcher, max_features=max_features,
             distance_ratio=distance_ratio, use_ransac=use_ransac,
-            ransac_threshold=ransac_threshold,
+            ransac_threshold=ransac_threshold, border_crop=border_crop,
         )
         if len(pairs) == 0:
             self.statusBar().showMessage("Auto keypoints: no pairs detected (transform unchanged).")
@@ -591,15 +1282,18 @@ class ImageAligner(QMainWindow):
             return
         enabled, model = dialog.distortion_request()
         self._estimate_keypoint_distortion(pairs, linear_matrix,
-                                           model if enabled else None, warn=True)
+                                           model if enabled else None, warn=True,
+                                           show_quality=enabled)
 
-    def _estimate_keypoint_distortion(self, pairs, linear_matrix, model, warn=False):
+    def _estimate_keypoint_distortion(self, pairs, linear_matrix, model, warn=False,
+                                      show_quality=False):
         """Set ``distortion_transform`` to the residual warp for ``model`` (or None).
 
         Shared by the dialog path and the headless/batch path. ``model`` None
         clears it; <3 pairs skips (warning optional). The residual composes with
-        the live linear transform in :meth:`_warp_with_distortion`.
-        """
+        the live linear transform in :meth:`_warp_with_distortion`. When
+        ``show_quality`` is set, a fit-quality popup (RMS / R² + deformation
+        grid) is shown after estimation."""
         self.distortion_transform = None
         if not model:
             return
@@ -609,16 +1303,69 @@ class ImageAligner(QMainWindow):
                                     f"Need >= 3 pairs for distortion ({len(pairs)} found); skipped.")
             return
         shape = self.template_image.shape if self.template_image is not None else self.moving_image.shape
+        prev_distortion = self.distortion_transform
         try:
-            self.distortion_transform = estimate_distortion(
+            new_distortion = estimate_distortion(
                 pairs, shape, model=model, residual_matrix=linear_matrix)
         except Exception as e:
             if warn:
                 QMessageBox.warning(self, "Distortion", f"Distortion estimate failed: {e}")
             self.distortion_transform = None
+            return
+        self.distortion_transform = new_distortion
+        if show_quality:
+            # Sanity check (#2c): image correlation before vs after the correction.
+            corr_before = self._distortion_corr(use_distortion=False)
+            corr_after = self._distortion_corr(use_distortion=True)
+
+            def _cancel():
+                self.distortion_transform = prev_distortion
+                self.apply_transform(self.transform_controls.transform_params)
+                self.statusBar().showMessage("Distortion correction cancelled.")
+
+            # Detection params from the keypoint dialog (for the popup listing #2).
+            params = None
+            dlg = self.auto_keypoints_dialog
+            if dlg is not None:
+                params = {"detector": dlg.detection_method.currentText(),
+                          "matcher": dlg.matching_method.currentText(),
+                          "distance_ratio": round(dlg.distance_ratio.value(), 2),
+                          "ransac_threshold": dlg.ransac_threshold.value(),
+                          "border_crop": dlg.border_crop_px(),
+                          "max_features": dlg.max_features.value()}
+            show_distortion_fit_quality(
+                self, self.distortion_transform, pairs, shape, model,
+                residual_matrix=linear_matrix, corr_before=corr_before,
+                corr_after=corr_after, on_cancel=_cancel, params=params)
+
+    def _distortion_corr(self, use_distortion):
+        """NCC of the template vs the moving warped with/without the current
+        distortion (for the fit-quality sanity check). Returns nan on failure."""
+        if self.template_image is None or self.moving_image is None:
+            return float("nan")
+        saved = self.distortion_transform
+        if not use_distortion:
+            self.distortion_transform = None
+        try:
+            warped = self._warp_with_distortion(self.moving_image, self.template_image.shape)
+        finally:
+            self.distortion_transform = saved
+        if warped is None:
+            return float("nan")
+        a = self.template_image.astype(np.float64).ravel()
+        b = warped.astype(np.float64).ravel()
+        m = (a != 0) & (b != 0)  # ignore the zero borders
+        if m.sum() < 16 or np.std(a[m]) < 1e-9 or np.std(b[m]) < 1e-9:
+            return float("nan")
+        return float(np.corrcoef(a[m], b[m])[0, 1])
 
     def reset_transformation(self):
-        """Reset both the linear transform and any distortion warp."""
+        """Reset the linear transform and distortion, but KEEP propagation.
+
+        Propagation lives in ``moving_field``/``moving_z_um`` (and the template
+        equivalents): the propagated wavefront is the image the transform acts
+        on, so a transform reset leaves the current propagation distances in
+        place (use 'Reset distance' per target to undo propagation)."""
         self.distortion_transform = None
         self.transform_controls.reset_transform()  # emits transform_changed -> apply_transform
 
@@ -659,6 +1406,10 @@ class ImageAligner(QMainWindow):
             self.optimize_phase_correlation()
         elif method == "Brute Force":
             self.optimize_brute_force()
+        elif method == "Distortion Correction":
+            self.open_distortion_tool()
+        elif method == "Change Distance":
+            self.open_distance_tool()
         else:
             self.optimize_enhanced_correlation()
             
@@ -1051,6 +1802,73 @@ class ImageAligner(QMainWindow):
         self.statusBar().showMessage(
             f"Exported transformed stack ({n_frames} frames) to: {Path(out_path).name}"
         )
+
+    def export_propagated_stack_to_folder(self, in_path, folder, suffix, optics,
+                                          z_tpl_um=0.0, z_mov_um=0.0,
+                                          template_path=None, save_template=True):
+        """Propagate + transform + distort a moving stack, write it (and optionally
+        the propagated template) to ``folder``.
+
+        For the **moving** stack at ``in_path``: each frame's complex field is
+        ASM-propagated by ``z_mov_um`` (at the moving sample-plane pixel size),
+        then warped into the template frame by the current transform + distortion
+        (channel-consistent via :func:`optics.warp_field_with_distortion`), split
+        back to phase+amp, saved as ``<stem><suffix>.tif``.
+
+        When ``save_template`` and ``template_path`` are given, the **template**
+        stack is ASM-propagated by ``z_tpl_um`` (no transform -- it is the
+        reference) and written as ``<tpl_stem><suffix>_template.tif``.
+
+        ``optics`` = ``{mag_tpl, na_tpl, mag_mov, na_mov, wavelength_nm,
+        camera_pixel_um, n}``. Used by Batch Mode's propagation-map save.
+        """
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cam = float(optics.get("camera_pixel_um", 5.86)) * 1e-6
+        lam = float(optics.get("wavelength_nm", 660.0)) * 1e-9
+        n = float(optics.get("n", 1.0))
+        px_mov = sample_pixel_size(cam, optics.get("mag_mov", 10.0))
+        px_tpl = sample_pixel_size(cam, optics.get("mag_tpl", 20.0))
+        out_shape = self.template_image.shape if self.template_image is not None else None
+        gm = self.current_transform.params if self.current_transform is not None else np.eye(3)
+        distortion = self.distortion_transform
+
+        def _save_one(path, z_um, px, warp):
+            try:
+                _p, _a, n_frames = load_wavefront_tif(path, frame_index=0)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load stack {Path(path).name}: {e}")
+                return None
+            shape = out_shape if (warp and out_shape is not None) else None
+            frames = []
+            for t in range(n_frames):
+                phase, amp, _ = load_wavefront_tif(path, frame_index=t)
+                field = field_from_phase_amp(phase, amp)
+                field = propagate_asm(field, z_um * 1e-6, lam, px, n=n)
+                if warp:
+                    field = warp_field_with_distortion(
+                        field, gm, distortion, shape if shape is not None else field.shape)
+                ph, am = phase_amp_from_field(field, unwrap=False)
+                frames.append(np.stack([ph, am], axis=-1))
+            return np.stack(frames, axis=0)  # (N, H, W, 2)
+
+        mov_stack = _save_one(in_path, z_mov_um, px_mov, warp=True)
+        if mov_stack is None:
+            return
+        mov_out = str(out_dir / f"{Path(in_path).stem}{suffix}.tif")
+        save_stack(mov_out, mov_stack, source_path=in_path,
+                   metas={"optics": optics, "z_mov_um": z_mov_um, "z_tpl_um": z_tpl_um})
+        saved = [Path(mov_out).name]
+
+        if save_template and template_path:
+            tpl_stack = _save_one(template_path, z_tpl_um, px_tpl, warp=False)
+            if tpl_stack is not None:
+                tpl_out = str(out_dir / f"{Path(template_path).stem}{suffix}_template.tif")
+                save_stack(tpl_out, tpl_stack, source_path=template_path,
+                           metas={"optics": optics, "z_tpl_um": z_tpl_um})
+                saved.append(Path(tpl_out).name)
+
+        self.statusBar().showMessage(f"Exported propagated stack(s): {', '.join(saved)}")
 
     def batch_process(self):
         """Apply transformation to a folder of images"""

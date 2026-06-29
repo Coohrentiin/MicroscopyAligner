@@ -128,6 +128,33 @@ def field_from_phase_amp(phase, amp):
     return amp * np.exp(1j * phase)
 
 
+def center_crop(arr, frac):
+    """Return the centered ``frac`` (0<frac<=1) sub-array of ``arr`` (H, W).
+
+    Used to run the focus search on a fast central ROI; the chosen z is then
+    applied to the full frame. ``frac >= 1`` returns the array unchanged.
+    """
+    arr = np.asarray(arr)
+    if frac is None or frac >= 1.0:
+        return arr
+    H, W = arr.shape[:2]
+    h = max(1, int(round(H * frac))); w = max(1, int(round(W * frac)))
+    y0 = (H - h) // 2; x0 = (W - w) // 2
+    return arr[y0:y0 + h, x0:x0 + w]
+
+
+def load_field(path, frame_index=0):
+    """Load a wavefront TIFF frame as a complex field ``amp*exp(i*phase)``.
+
+    Thin wrapper over :func:`utils_images.load_wavefront_tif` so callers (the
+    focusing tool, batch mode's propagation map) get a ready complex field.
+    Returns ``(field, n_frames)``.
+    """
+    from utils_images import load_wavefront_tif  # local import: avoid cycle at module load
+    phase, amp, n_frames = load_wavefront_tif(path, frame_index=frame_index)
+    return field_from_phase_amp(phase, amp), int(n_frames)
+
+
 def unwrapped_phase(field, subtract_median=False):
     """Spatially-unwrapped phase (radians, float32) of a complex field.
 
@@ -196,9 +223,83 @@ def propagate_asm(field, z, wavelength, pixel_size, n=1.0, band_limit=True):
 
     lam = float(wavelength) / float(n)
     k = 2.0 * np.pi / lam
+    if _TORCH_OK:
+        # GPU single propagation (matches the batched/numpy math to ~1e-15).
+        dev = _TORCH_DEVICE
+        H, W = field.shape
+        fx = _torch.fft.fftfreq(W, d=float(pixel_size), device=dev, dtype=_torch.float64)
+        fy = _torch.fft.fftfreq(H, d=float(pixel_size), device=dev, dtype=_torch.float64)
+        FY, FX = _torch.meshgrid(fy, fx, indexing="ij")
+        arg = 1.0 - (lam * FX) ** 2 - (lam * FY) ** 2
+        prop = arg >= 0.0
+        Hf = _torch.where(prop, _torch.exp(1j * (k * float(z)) * _torch.sqrt(_torch.clamp(arg, min=0.0))),
+                          _torch.zeros((), dtype=_torch.complex128, device=dev))
+        if band_limit:
+            dfx = 1.0 / (W * float(pixel_size)); dfy = 1.0 / (H * float(pixel_size))
+            fx_max = 1.0 / (lam * _torch.sqrt(_torch.tensor((2.0 * dfx * z) ** 2 + 1.0, device=dev)))
+            fy_max = 1.0 / (lam * _torch.sqrt(_torch.tensor((2.0 * dfy * z) ** 2 + 1.0, device=dev)))
+            Hf = _torch.where((FX.abs() <= fx_max) & (FY.abs() <= fy_max), Hf,
+                              _torch.zeros((), dtype=_torch.complex128, device=dev))
+        spec = _torch.fft.fft2(_torch.as_tensor(field, device=dev, dtype=_torch.complex128))
+        return _torch.fft.ifft2(spec * Hf).cpu().numpy()
+
     FX, FY = _freq_grids(field.shape, pixel_size)
     Hf = _asm_transfer(FX, FY, float(z), lam, k, pixel_size, band_limit)
     return np.fft.ifft2(np.fft.fft2(field) * Hf)
+
+
+class Propagator:
+    """Cached ASM propagator for a FIXED field over varying z (GPU when available).
+
+    Precomputes the field's FFT and the frequency grids once; each
+    :meth:`at` only builds the transfer function and runs one inverse FFT. This
+    is the hot path for the interactive distance slider / live overlay, where
+    the field is constant and only z changes. ``band_limit`` defaults off (the
+    slider's z range is small).
+    """
+
+    def __init__(self, field, wavelength, pixel_size, n=1.0, band_limit=False):
+        self.lam = float(wavelength) / float(n)
+        self.k = 2.0 * np.pi / self.lam
+        self.pixel_size = float(pixel_size)
+        self.band_limit = band_limit
+        self.shape = np.asarray(field).shape
+        if _TORCH_OK:
+            dev = _TORCH_DEVICE
+            H, W = self.shape
+            fx = _torch.fft.fftfreq(W, d=self.pixel_size, device=dev, dtype=_torch.float64)
+            fy = _torch.fft.fftfreq(H, d=self.pixel_size, device=dev, dtype=_torch.float64)
+            self._FY, self._FX = _torch.meshgrid(fy, fx, indexing="ij")
+            self._arg = 1.0 - (self.lam * self._FX) ** 2 - (self.lam * self._FY) ** 2
+            self._root = _torch.sqrt(_torch.clamp(self._arg, min=0.0))
+            self._prop = self._arg >= 0.0
+            self._spec = _torch.fft.fft2(_torch.as_tensor(field, device=dev, dtype=_torch.complex128))
+        else:
+            self._FX, self._FY = _freq_grids(self.shape, self.pixel_size)
+            self._spec = np.fft.fft2(np.asarray(field, dtype=np.complex128))
+
+    def at(self, z):
+        """Return the field propagated to distance ``z`` (metres), as numpy."""
+        z = float(z)
+        if z == 0:
+            if _TORCH_OK:
+                return _torch.fft.ifft2(self._spec).cpu().numpy()
+            return np.fft.ifft2(self._spec)
+        if _TORCH_OK:
+            dev = _TORCH_DEVICE
+            Hf = _torch.where(self._prop,
+                              _torch.exp(1j * (self.k * z) * self._root),
+                              _torch.zeros((), dtype=_torch.complex128, device=dev))
+            if self.band_limit:
+                H, W = self.shape
+                dfx = 1.0 / (W * self.pixel_size); dfy = 1.0 / (H * self.pixel_size)
+                fx_max = 1.0 / (self.lam * _torch.sqrt(_torch.tensor((2.0 * dfx * z) ** 2 + 1.0, device=dev)))
+                fy_max = 1.0 / (self.lam * _torch.sqrt(_torch.tensor((2.0 * dfy * z) ** 2 + 1.0, device=dev)))
+                Hf = _torch.where((self._FX.abs() <= fx_max) & (self._FY.abs() <= fy_max), Hf,
+                                  _torch.zeros((), dtype=_torch.complex128, device=dev))
+            return _torch.fft.ifft2(self._spec * Hf).cpu().numpy()
+        Hf = _asm_transfer(self._FX, self._FY, z, self.lam, self.k, self.pixel_size, self.band_limit)
+        return np.fft.ifft2(self._spec * Hf)
 
 
 def _freq_grids(shape, pixel_size):
@@ -240,7 +341,6 @@ def propagate_asm_stack(field, z_values, wavelength, pixel_size, n=1.0,
     z_values = np.asarray(z_values, dtype=np.float64)
     lam = float(wavelength) / float(n)
     k = 2.0 * np.pi / lam
-    print(f">Propagating {field.shape} field to {z_values.size} planes with ASM (torch: {_TORCH_OK})")
     if _TORCH_OK:
         dev = _TORCH_DEVICE
         H, W = field.shape
@@ -268,7 +368,6 @@ def propagate_asm_stack(field, z_values, wavelength, pixel_size, n=1.0,
             Hf = _torch.where((z == 0), ones, Hf)
         spec = _torch.fft.fft2(_torch.as_tensor(field, device=dev, dtype=_torch.complex128))
         out = _torch.fft.ifft2(spec[None] * Hf)
-        print(f"<< Propagated to {out.shape} stack on {_TORCH_DEVICE}")
         return out.cpu().numpy()
 
     # numpy fallback
@@ -408,38 +507,121 @@ def focus_consistency_curve(field_a, field_b, z_values,
     return z_values, out
 
 
+def _overlap_bbox(mask, border=0):
+    """Bounding box (y0, y1, x0, x1) of ``mask`` shrunk by ``border`` px each side.
+
+    Returns ``None`` if nothing is left. Used to restrict the focus-check metric
+    to the common valid region and avoid warp/propagation edge artifacts.
+    """
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    y0, y1 = int(ys.min()) + border, int(ys.max()) + 1 - border
+    x0, x1 = int(xs.min()) + border, int(xs.max()) + 1 - border
+    if y1 - y0 < 1 or x1 - x0 < 1:
+        return None
+    return (y0, y1, x0, x1)
+
+
 def focus_consistency_map(field_a, field_b, z_a_values, z_b_values,
                           wavelength_a, wavelength_b,
                           pixel_size_a, pixel_size_b,
-                          n=1.0, metric="ncc", roi=None, fit_b=None):
-    """2-D focus-consistency map over (z_a, z_b).
+                          n=1.0, metric="ncc", roi=None, fit_b=None,
+                          align_b=None, border=16, progress=None):
+    """2-D focus-consistency map over (z_a, z_b), alignment- & overlap-aware.
 
     Propagates ``field_a`` (template) over ``z_a_values`` and ``field_b``
-    (moving) over ``z_b_values`` -- each stack computed once (GPU-batched) --
-    then scores every pair with ``metric`` in ``{"ncc","l2","ssim"}`` (amplitude
-    comparison).  ``fit_b`` optionally maps each propagated moving frame onto the
-    template shape (so the ROI lines up). The peak ``(z_a, z_b)`` is the
-    co-focus point; the panel draws cross-hairs at the current focus.
+    (moving) over ``z_b_values`` (each stack computed once, GPU-batched), then
+    scores every pair with ``metric`` in ``{"ncc","l2","ssim"}`` (amplitude).
+
+    - ``align_b(complex_frame) -> complex_frame``: applied to each propagated
+      moving frame to bring it into the template frame using any prior
+      alignment (transform + distortion). Supersedes ``fit_b`` when given.
+    - The comparison is restricted to the **common non-zero overlap** of the
+      template and the aligned moving frame, with the border eroded by
+      ``border`` px (default 16) to drop warp/FFT edge artifacts. ``roi``, when
+      given, further restricts the region.
+    - ``progress(done, total)``: optional callback for a progress bar.
 
     Returns ``(z_a_values, z_b_values, map2d)`` with ``map2d`` shape
-    ``(len(z_b_values), len(z_a_values))`` (rows = z_b, cols = z_a).
+    ``(len(z_b_values), len(z_a_values))`` (rows = z_b, cols = z_a). Cells with
+    too little overlap are NaN.
     """
     z_a_values = np.asarray(z_a_values, dtype=np.float64)
     z_b_values = np.asarray(z_b_values, dtype=np.float64)
+    transform_b = align_b if align_b is not None else fit_b
+
     stack_a = propagate_asm_stack(field_a, z_a_values, wavelength_a, pixel_size_a, n=n)
     stack_b = propagate_asm_stack(field_b, z_b_values, wavelength_b, pixel_size_b, n=n)
-    amps_a = [_roi_crop(np.abs(stack_a[i]), roi) for i in range(z_a_values.size)]
+
+    amps_a = [np.abs(stack_a[i]) for i in range(z_a_values.size)]
     amps_b = []
     for j in range(z_b_values.size):
         fb = stack_b[j]
-        if fit_b is not None:
-            fb = fit_b(fb)
-        amps_b.append(_roi_crop(np.abs(fb), roi))
+        if transform_b is not None:
+            fb = transform_b(fb)
+        amps_b.append(np.abs(fb))
+
+    # Common valid region: where the template and the aligned moving are both
+    # non-zero (the warp zero-fills outside the moving's mapped support). The
+    # alignment is z-independent so one representative aligned frame defines it.
+    tpl_valid = amps_a[len(amps_a) // 2] > 0
+    mov_valid = amps_b[len(amps_b) // 2] > 0
+    valid = tpl_valid & mov_valid
+    bbox = _overlap_bbox(valid, border=border)
+    if bbox is None:
+        bbox = (0, amps_a[0].shape[0], 0, amps_a[0].shape[1])
+    # Intersect with an explicit ROI if provided.
+    if roi is not None:
+        ry0, ry1, rx0, rx1 = roi
+        by0, by1, bx0, bx1 = bbox
+        bbox = (max(by0, ry0), min(by1, ry1), max(bx0, rx0), min(bx1, rx1))
+
+    y0, y1, x0, x1 = bbox
+    amps_a = [a[y0:y1, x0:x1] for a in amps_a]
+    amps_b = [b[y0:y1, x0:x1] for b in amps_b]
+
+    total = z_b_values.size * z_a_values.size
     out = np.empty((z_b_values.size, z_a_values.size), dtype=np.float64)
+    done = 0
     for j in range(z_b_values.size):
         for i in range(z_a_values.size):
             out[j, i] = _similarity(amps_a[i], amps_b[j], metric)
+            done += 1
+        if progress is not None:
+            progress(done, total)
     return z_a_values, z_b_values, out
+
+
+def optimal_indices(map2d, mode="global", ref_col=None, ref_row=None):
+    """Indices ``(i_col=z_a, j_row=z_b)`` of the optimum (max) of ``map2d``.
+
+    ``mode``:
+    - ``"global"``   : argmax over the whole map.
+    - ``"vs_template"``: best moving z at the template column ``ref_col`` (fix
+      template focus -> search the vertical line).
+    - ``"vs_moving"``  : best template z at the moving row ``ref_row`` (fix
+      moving focus -> search the horizontal line).
+
+    Returns ``(i_col, j_row)`` or ``None`` if all-NaN.
+    """
+    if not np.any(np.isfinite(map2d)):
+        return None
+    nrow, ncol = map2d.shape
+    if mode == "vs_template" and ref_col is not None:
+        col = np.clip(int(ref_col), 0, ncol - 1)
+        line = map2d[:, col]
+        if not np.any(np.isfinite(line)):
+            return None
+        return col, int(np.nanargmax(line))
+    if mode == "vs_moving" and ref_row is not None:
+        row = np.clip(int(ref_row), 0, nrow - 1)
+        line = map2d[row, :]
+        if not np.any(np.isfinite(line)):
+            return None
+        return int(np.nanargmax(line)), row
+    j, i = np.unravel_index(np.nanargmax(map2d), map2d.shape)
+    return int(i), int(j)
 
 
 # ------------------------------------------------------------ metadata reader
@@ -581,6 +763,9 @@ def estimate_distortion(pairs, template_shape, model="tps", order=2,
     if model == "radial":
         return _RadialDistortion.fit(src, dst, grid=radial_grid)
 
+    if model == "spherical":
+        return _SphericalDistortion.fit(src, dst, grid=radial_grid)
+
     raise ValueError(f"Unknown distortion model: {model!r}")
 
 
@@ -635,7 +820,107 @@ class _RadialDistortion:
         return best[1]
 
 
-def warp_field_with_distortion(field, global_matrix, distortion_tf, output_shape):
+class _SphericalDistortion:
+    """Free-center spherical curvature mapping template -> moving.
+
+    A spherical (cap) deformation makes the apparent in-plane radial position
+    grow with a leading cubic term: ``p_out = c + (p_in - c) * (1 + k * r^2)``
+    with ``r = ||p_in - c||`` so the displacement ``|p_out - p_in| ~ k * r^3``.
+    Fitting ``k`` (and the center ``c``) from keypoint correspondences estimates
+    the curvature; ``k > 0`` = barrel-like (moving stretched outward), ``k < 0``
+    = pincushion. Compatible with :func:`skimage.transform.warp` via ``__call__``.
+    """
+
+    def __init__(self, center, k):
+        self.center = np.asarray(center, dtype=np.float64)
+        self.k = float(k)
+
+    def __call__(self, coords):
+        coords = np.asarray(coords, dtype=np.float64)
+        d = coords - self.center
+        r2 = np.sum(d * d, axis=1)
+        return self.center + d * (1.0 + self.k * r2)[:, None]
+
+    def effective_radius(self):
+        """Rough effective sphere radius (px): ``r`` where displacement ~ r/... .
+        Returns ``1/sqrt(|k|)`` as a curvature length scale, or inf if flat."""
+        return float("inf") if abs(self.k) < 1e-18 else float(1.0 / np.sqrt(abs(self.k)))
+
+    @classmethod
+    def fit(cls, src, dst, grid=9):
+        """Free-center fit: grid-search the center, linear least-squares for k.
+
+        ``src``/``dst`` are template/moving (or residual) points. Returns the
+        best :class:`_SphericalDistortion`."""
+        src = np.asarray(src, dtype=np.float64); dst = np.asarray(dst, dtype=np.float64)
+        cxs = np.linspace(src[:, 0].min(), src[:, 0].max(), grid)
+        cys = np.linspace(src[:, 1].min(), src[:, 1].max(), grid)
+        best = None
+        for cx in cxs:
+            for cy in cys:
+                c = np.array([cx, cy])
+                d = src - c
+                r2 = np.sum(d * d, axis=1)
+                # (dst - c) - d = d * (k * r2)  -> solve scalar k by least squares
+                rhs = (dst - c) - d
+                A = np.concatenate([d[:, 0] * r2, d[:, 1] * r2])
+                b = np.concatenate([rhs[:, 0], rhs[:, 1]])
+                denom = float(A @ A)
+                k = float(A @ b / denom) if denom > 1e-18 else 0.0
+                model = cls(c, k)
+                err = float(np.mean(np.sum((model(src) - dst) ** 2, axis=1)))
+                if best is None or err < best[0]:
+                    best = (err, model)
+        return best[1]
+
+
+def distortion_fit_quality(distortion_tf, pairs, residual_matrix=None):
+    """Quality metrics of a fitted distortion against the correspondences.
+
+    Maps the template points through ``distortion_tf`` and compares to the
+    (optionally residual_matrix-mapped) moving points. Returns a dict with
+    ``rms`` (px), ``r2`` (1 - SS_res/SS_tot of the displacement), ``max_err``,
+    ``n`` and, for spherical/radial models, ``k`` / ``effective_radius_px``.
+    """
+    template_pts, moving_pts = _pairs_to_arrays(pairs)
+    dst = moving_pts
+    if residual_matrix is not None:
+        M = np.asarray(residual_matrix, dtype=float)
+        hom = np.hstack([moving_pts, np.ones((len(moving_pts), 1))])
+        mapped = (M @ hom.T).T
+        dst = mapped[:, :2] / mapped[:, 2:3]
+    pred = np.asarray(distortion_tf(template_pts), dtype=np.float64)
+    res = pred - dst
+    sq = np.sum(res * res, axis=1)
+    rms = float(np.sqrt(np.mean(sq)))
+    # R^2 on the displacement field (how much of template->dst motion is explained).
+    disp = dst - template_pts
+    ss_tot = float(np.sum((disp - disp.mean(axis=0)) ** 2))
+    ss_res = float(np.sum(res * res))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
+    out = {"rms": rms, "r2": r2, "max_err": float(np.sqrt(sq.max())), "n": len(pairs)}
+    if hasattr(distortion_tf, "k"):
+        out["k"] = float(distortion_tf.k)
+    if hasattr(distortion_tf, "effective_radius"):
+        out["effective_radius_px"] = distortion_tf.effective_radius()
+    return out
+
+
+def deformation_grid(distortion_tf, shape, n=16):
+    """Return (xs_src, ys_src, xs_dst, ys_dst) of a regular grid mapped through
+    ``distortion_tf`` (template -> moving) for a quiver/grid visualization.
+
+    ``shape`` = (H, W); ``n`` grid lines per axis. Each is an (n, n) array."""
+    H, W = shape
+    gx, gy = np.meshgrid(np.linspace(0, W - 1, n), np.linspace(0, H - 1, n))
+    coords = np.column_stack([gx.ravel(), gy.ravel()])
+    mapped = np.asarray(distortion_tf(coords), dtype=np.float64)
+    xs_dst = mapped[:, 0].reshape(n, n); ys_dst = mapped[:, 1].reshape(n, n)
+    return gx, gy, xs_dst, ys_dst
+
+
+def warp_field_with_distortion(field, global_matrix, distortion_tf, output_shape,
+                               input_offset=(0.0, 0.0)):
     """Warp a COMPLEX field by a global similarity (+ optional distortion).
 
     The real and imaginary parts are warped **separately** with the same
@@ -644,10 +929,16 @@ def warp_field_with_distortion(field, global_matrix, distortion_tf, output_shape
     ``global_matrix`` maps moving -> template (the ImageAligner convention), so
     the inverse map fed to :func:`skimage.transform.warp` is its inverse,
     composed with the distortion (which already maps template -> moving).
+
+    ``input_offset`` ``(dx, dy)`` is added to the final moving (input) coords.
+    Use it to sample a LARGER, un-cropped moving field with a matrix that was
+    estimated on a centered crop: pass the crop's ``(x0, y0)`` so output borders
+    are filled from the moving periphery instead of going black.
     """
     field = np.asarray(field, dtype=np.complex128)
 
     global_tf = tf.AffineTransform(matrix=np.asarray(global_matrix, dtype=float))
+    ox, oy = float(input_offset[0]), float(input_offset[1])
 
     def inverse_map(coords):
         # skimage.warp passes OUTPUT (template) coords and expects INPUT
@@ -656,6 +947,8 @@ def warp_field_with_distortion(field, global_matrix, distortion_tf, output_shape
         moving_coords = global_tf.inverse(coords)
         if distortion_tf is not None:
             moving_coords = distortion_tf(moving_coords)
+        if ox or oy:
+            moving_coords = moving_coords + np.array([ox, oy])
         return moving_coords
 
     re = tf.warp(field.real, inverse_map, output_shape=output_shape, preserve_range=True)
