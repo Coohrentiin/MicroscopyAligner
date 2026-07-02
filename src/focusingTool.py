@@ -29,11 +29,36 @@ global similarity + distortion are applied channel-consistently to the complex
 field at export and written with :func:`utils_images.save_stack`.
 """
 import json
+import re
 from pathlib import Path
 
 import numpy as np
-from natsort import natsorted
+from natsort import natsort_keygen
 from skimage import transform as tf
+
+_NATKEY = natsort_keygen()
+# Sequence token like ``BDD_045``: a letter token followed by ``_<digits>``.
+_SEQ_RE = re.compile(r'([A-Za-z]+)_(\d+)')
+
+
+def sequence_sorted(paths):
+    """Sort files so differing-prefix acquisitions with the same sequence number
+    line up on the same row.
+
+    Keys on the LAST ``<letters>_<digits>`` group of each filename stem (e.g.
+    ``BDD_045`` -> token ``BDD`` number ``45``), so ``PDHM_10x_BDD_045_0`` and
+    ``DHM_20x_BDD_045_0`` sort together (NNN=045) despite different prefixes.
+    Files with no such token fall back to natural order after those that do; ties
+    break on the natural sort of the full name.
+    """
+    def key(p):
+        stem = Path(p).stem
+        matches = _SEQ_RE.findall(stem)
+        if matches:
+            tok, num = matches[-1]
+            return (0, tok.upper(), int(num), _NATKEY(stem))
+        return (1, "", 0, _NATKEY(stem))
+    return sorted(paths, key=key)
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton, QTableWidget,
@@ -295,7 +320,9 @@ class FocusingPanel(QWidget):
         sec.addStretch()
         v.addLayout(sec)
 
-        hint = QLabel("Browse fills the column downward from the selected row (natsorted, adding rows). "
+        hint = QLabel("Browse fills the column downward from the selected row, sorted by the "
+                      "filename sequence (…BDD_NNN…) so template/moving/secondaries with the "
+                      "same NNN line up on one row (adding rows). "
                       "Click a row to make it the working sample for refocus / actions. "
                       "Secondary images are NOT displayed; at save they get the same transform "
                       "(moving: propagation+matrix+distortion; template: propagation) as the primary.")
@@ -605,7 +632,7 @@ class FocusingPanel(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, f"Select {which} WF files", "", WF_FILTER)
         if not paths:
             return
-        paths = natsorted(paths)
+        paths = sequence_sorted(paths)
         start = max(0, self.table.currentRow())
         for i, path in enumerate(paths):
             r = start + i
@@ -629,7 +656,7 @@ class FocusingPanel(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, f"Select secondary {which} WF files", "", WF_FILTER)
         if not paths:
             return
-        paths = natsorted(paths)
+        paths = sequence_sorted(paths)
         key = "secondary_moving_paths" if which == "moving" else "secondary_template_paths"
         start = max(0, self.table.currentRow())
         for i, path in enumerate(paths):
