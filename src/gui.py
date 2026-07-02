@@ -252,6 +252,12 @@ class DistanceDialog(QDialog):
         self.mag.setValue(self.ctrl.magnification(tgt))
         self.mag.blockSignals(False)
         cur = self.ctrl.current_z(tgt)
+        # Grow the half-range so the current z isn't clamped by the slider (which
+        # would truncate a maintained distance to +/-half when the user nudges it).
+        if abs(cur) > self.half.value():
+            self.half.blockSignals(True)
+            self.half.setValue(min(self.half.maximum(), abs(cur) * 1.5))
+            self.half.blockSignals(False)
         self.slider.blockSignals(True)
         self.slider.setValue(int(round(cur / max(self.half.value(), 1e-9) * self.Z_STEPS)))
         self.slider.blockSignals(False)
@@ -312,6 +318,8 @@ class DistanceDialog(QDialog):
             self._on_target_changed(self.target.currentText())
 
         def on_cell(z_tpl_um, z_mov_um):
+            # APPLY the clicked point (so save/next steps use it), then preview.
+            self.ctrl.apply_optimal(z_tpl_um, z_mov_um)
             self.ctrl.overlay_cell(z_tpl_um, z_mov_um, overlay_align_b)
 
         if self._focus_map_window is None:

@@ -1541,6 +1541,11 @@ class FocusingPanel(QWidget):
             ctx = getattr(self, "_fc_ctx", None)
             if not ctx:
                 return
+            # APPLY the clicked point to the row so it's what save/next steps use
+            # (the last-clicked z is the chosen focus, not just a preview).
+            item["z_tpl_um"] = float(z_tpl_um)
+            item["z_mov_um"] = float(z_mov_um)
+            self._update_row(self.current_index)
             tpl = opt.propagate_asm(self._tpl_field, z_tpl_um * 1e-6, ctx["lam"], ctx["px_tpl"], n=ctx["n"])
             mov = ctx["align_b"](opt.propagate_asm(self._mov_field, z_mov_um * 1e-6, ctx["lam"], ctx["px_mov"], n=ctx["n"]))
             a = self.aligner
@@ -1553,6 +1558,9 @@ class FocusingPanel(QWidget):
             a.moving_image = self._field_to_observable(mov); a.transformed_image = a.moving_image
             a.moving_image_file = row["moving_path"]
             a.onViewModeChanged("overlay"); a.update_display()
+            self.status_label.setText(
+                f"Focus (clicked): z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm — "
+                f"click 'Use optimal' for the auto optimum, or Close to keep this.")
 
         if self._focus_map_window is None:
             self._focus_map_window = FocusMapWindow(on_use_optimal=use_optimal, on_cell=on_cell)
