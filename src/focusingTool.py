@@ -447,7 +447,14 @@ class FocusingPanel(QWidget):
         run_all.setStyleSheet("QPushButton { background-color: #9C27B0; }")
         run_rows = QPushButton("Run All Rows"); run_rows.clicked.connect(self._run_all_rows)
         run_rows.setStyleSheet("QPushButton { background-color: #9C27B0; }")
-        for b in (rem_act, up, down, step, reset_steps, run_all, run_rows):
+        run_inherit = QPushButton("Execute sequence with inherit")
+        run_inherit.setStyleSheet("QPushButton { background-color: #673AB7; }")
+        run_inherit.setToolTip(
+            "For every row from the current one down: inherit the previous row's "
+            "focus + transform, then replay the sequence headlessly. If it ends "
+            "with a Save, the output folder is asked once. Progress shown in the terminal (tqdm).")
+        run_inherit.clicked.connect(self._run_inherit_rows)
+        for b in (rem_act, up, down, step, reset_steps, run_all, run_rows, run_inherit):
             edit_row.addWidget(b)
         edit_row.addStretch()
         default_seq = QPushButton("Load Default Sequence")
@@ -1752,6 +1759,62 @@ class FocusingPanel(QWidget):
             self._blocking_run = False
         progress.close()
         self._update_status()
+
+    def _run_inherit_rows(self):
+        """Replay the sequence over every row from the current one down, using
+        inheritance from the previous row for each (focus + transform seeded,
+        then the sequence refines). Runs headlessly (no interactive map/distortion
+        popups). If the sequence ends with a ``save``, the output folder is asked
+        ONCE and reused for all rows. Terminal progress via tqdm.
+        """
+        if not self.actions:
+            QMessageBox.information(self, "Focusing", "No actions in the sequence.")
+            return
+        start = max(0, self.table.currentRow())
+        rows = [r for r in range(start, len(self.rows)) if self.rows[r]["moving_path"]]
+        if not rows:
+            QMessageBox.information(self, "Focusing",
+                                    "No rows with a moving image from the selected one onward.")
+            return
+
+        # If the sequence ends with a save, ask the folder ONCE and inject it so
+        # per-row _exec_save doesn't prompt.
+        actions = [dict(a) for a in self.actions]
+        last = actions[-1]
+        if last.get("type") == "save" and not last.get("folder"):
+            folder = QFileDialog.getExistingDirectory(self, "Select Output Folder (used for all rows)")
+            if not folder:
+                return  # user cancelled -> abort the whole run
+            last["folder"] = folder
+
+        try:
+            from tqdm import tqdm
+        except ImportError:  # pragma: no cover - tqdm is a listed dep
+            tqdm = None
+
+        progress = QProgressDialog("Executing sequence with inherit…", "Cancel", 0, len(rows), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        self._blocking_run = False  # headless: no map/distortion popups block the run
+        bar = tqdm(rows, desc="Execute w/ inherit", unit="row") if tqdm else rows
+        try:
+            for n, r in enumerate(bar):
+                if progress.wasCanceled():
+                    break
+                if tqdm:
+                    bar.set_postfix_str(Path(self.rows[r]["moving_path"]).name)
+                self.table.setCurrentCell(r, 0)  # _send_to_window inherits + rebuilds state
+                self._send_to_window(r)
+                for action in actions:
+                    self._execute_action(action)
+                progress.setValue(n + 1)
+        finally:
+            if tqdm:
+                bar.close()
+            progress.close()
+        self._update_status()
+        self.status_label.setText(
+            f"Executed sequence with inherit over {len(rows)} row(s) from row {start + 1}.")
 
     # ------------------------------------------------------------ persistence
     def _save_config(self):
