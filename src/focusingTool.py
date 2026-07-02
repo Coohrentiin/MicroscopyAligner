@@ -143,6 +143,7 @@ class FocusingPanel(QWidget):
 
     STATUS_PENDING = "pending"
     STATUS_DONE = "done"
+    STATUS_INHERITED = "inherited"
 
     def __init__(self, aligner):
         super().__init__()
@@ -681,10 +682,41 @@ class FocusingPanel(QWidget):
             self._send_to_window(row)
 
     # ------------------------------------------------------------ window drive
+    def _inherit_from_previous(self, row):
+        """Seed an UN-aligned row from the previous row's transform + distances so
+        the user can save as-is when no realignment is needed (#2).
+
+        Only applies when this row has no alignment yet (no matrix/distortion,
+        z's at 0, still pending) and the previous row DOES have one. Copies
+        z_tpl_um / z_mov_um / global_matrix / distortion / optics.
+        """
+        if row <= 0 or row >= len(self.rows):
+            return
+        it = self.rows[row]
+        already = (it.get("global_matrix") is not None or it.get("distortion") is not None
+                   or it.get("z_tpl_um") or it.get("z_mov_um")
+                   or it.get("status") == self.STATUS_DONE)
+        if already:
+            return
+        prev = self.rows[row - 1]
+        if prev.get("global_matrix") is None and prev.get("distortion") is None \
+                and not prev.get("z_tpl_um") and not prev.get("z_mov_um"):
+            return  # previous row has nothing to inherit
+        it["z_tpl_um"] = prev.get("z_tpl_um", 0.0)
+        it["z_mov_um"] = prev.get("z_mov_um", 0.0)
+        it["global_matrix"] = ([list(map(float, r)) for r in prev["global_matrix"]]
+                               if prev.get("global_matrix") is not None else None)
+        it["distortion"] = (dict(prev["distortion"]) if prev.get("distortion") else None)
+        if prev.get("optics"):
+            it["optics"] = dict(prev["optics"])
+        it["status"] = self.STATUS_INHERITED
+        self.status_label.setText(f"Row {row + 1}: inherited transform + focus from row {row}.")
+
     def _send_to_window(self, row):
         """Make ``row`` the working sample: rebuild its complex fields and show."""
         if not (0 <= row < len(self.rows)):
             return
+        self._inherit_from_previous(row)
         item = self.rows[row]
         self.current_index = row
         if item.get("optics"):
@@ -701,6 +733,7 @@ class FocusingPanel(QWidget):
         self.z_spin.setValue(item["z_mov_um"] if self._refocus_target == "moving" else item["z_tpl_um"])
         self._step_index = 0  # step-by-step restarts for the newly selected row
         self._rebuild_fields(row)
+        self._update_row(row)  # reflect any inherited z / status in the table
         self._update_status()
 
     @staticmethod

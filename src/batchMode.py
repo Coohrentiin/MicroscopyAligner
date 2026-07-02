@@ -129,6 +129,8 @@ class FocusMapWindow(QWidget):
         self._za = self._zb = None
         self._map = None
         self._metric = "ncc"
+        self._sel_artists = []           # user-click selection marker artists
+        self._user_selected = False      # True once the user clicks a point
         # Reference indices for the line-constrained optima (the current focus).
         self._ref_col = None             # template column index
         self._ref_row = None             # moving row index
@@ -195,6 +197,7 @@ class FocusMapWindow(QWidget):
         if self._map is None:
             return
         self.ax.clear()
+        self._sel_artists = []  # ax.clear() removed any selection marker
         extent = [self._za[0], self._za[-1], self._zb[-1], self._zb[0]]  # origin upper
         im = self.ax.imshow(self._map, aspect="auto", cmap="viridis",
                             extent=extent, origin="upper")
@@ -222,7 +225,7 @@ class FocusMapWindow(QWidget):
         else:
             self.info.setText("Map all-NaN (degenerate); no optimum.")
             self.use_btn.setEnabled(False)
-        self.ax.set_title(f"Propagation map ({self._metric})  ·  click for live overlay", fontsize=9)
+        self.ax.set_title(f"Propagation map ({self._metric})  ·  click a point to select it", fontsize=9)
         self.ax.set_xlabel("template z (µm)"); self.ax.set_ylabel("moving z (µm)")
         try:
             self.fig.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
@@ -235,11 +238,38 @@ class FocusMapWindow(QWidget):
         self.mode_combo.setCurrentIndex((self.mode_combo.currentIndex() + delta) % n)
 
     def _on_click(self, event):
-        """Live feedback: clicking a cell overlays template@z_tpl / moving@z_mov
-        in the main window via ``on_cell``."""
-        if event.inaxes is not self.ax or event.xdata is None or self._on_cell is None:
+        """Click selects a (z_tpl, z_mov) point: snap to the nearest grid cell,
+        make it the current selection (so 'Use optimal' applies THIS point, not
+        the auto optimum), draw a selection marker, and preview it via ``on_cell``."""
+        if event.inaxes is not self.ax or event.xdata is None:
             return
-        self._on_cell(float(event.xdata), float(event.ydata))
+        # Snap to the nearest computed grid point so the applied z matches a cell.
+        if self._za is not None and self._zb is not None:
+            i = int(np.argmin(np.abs(self._za - event.xdata)))
+            j = int(np.argmin(np.abs(self._zb - event.ydata)))
+            self._peak = (float(self._za[i]), float(self._zb[j]))
+        else:
+            self._peak = (float(event.xdata), float(event.ydata))
+        # Redraw the marker at the clicked selection.
+        self._draw_selection_marker()
+        self.info.setText(f"Selected: z_tpl={self._peak[0]:.2f} µm, z_mov={self._peak[1]:.2f} µm "
+                          f"(click 'Use optimal' to apply)")
+        self.use_btn.setEnabled(True)
+        if self._on_cell is not None:
+            self._on_cell(self._peak[0], self._peak[1])
+
+    def _draw_selection_marker(self):
+        """Overlay a distinct marker at the current selection (self._peak)."""
+        # Remove any prior selection marker, keep the map + optimum markers.
+        for ln in list(getattr(self, "_sel_artists", [])):
+            try:
+                ln.remove()
+            except Exception:
+                pass
+        self._sel_artists = self.ax.plot(self._peak[0], self._peak[1], "x",
+                                         color="cyan", markersize=14, markeredgewidth=3,
+                                         label="selected")
+        self.canvas.draw_idle()
 
     def _use_optimal(self):
         # Apply the chosen optimum (and refresh) BEFORE ending any modal wait, so
