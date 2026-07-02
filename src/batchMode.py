@@ -131,6 +131,8 @@ class FocusMapWindow(QWidget):
         self._metric = "ncc"
         self._sel_artists = []           # user-click selection marker artists
         self._user_selected = False      # True once the user clicks a point
+        self._maximize = True            # sense of the optimum (max vs min metric)
+        self._cbar = None                # single reused colorbar (item 4)
         # Reference indices for the line-constrained optima (the current focus).
         self._ref_col = None             # template column index
         self._ref_row = None             # moving row index
@@ -176,22 +178,35 @@ class FocusMapWindow(QWidget):
         self.progress.setValue(done)
         QApplication.processEvents()
 
-    def set_map(self, za_um, zb_um, map2d, metric, ref_col=None, ref_row=None):
+    def set_map(self, za_um, zb_um, map2d, metric, ref_col=None, ref_row=None,
+                maximize=True, mode=None):
         """Store the map + render it; ``ref_col``/``ref_row`` are the current
-        template/moving focus indices used by the line-constrained modes."""
+        template/moving focus indices used by the line-constrained modes.
+
+        ``maximize`` sets the optimum sense (max vs min metric). ``mode``, when
+        given, preselects the focal-point mode (``global``/``vs_template``/
+        ``vs_moving``) so the auto optimum lands on the user's chosen one."""
         self._za = np.asarray(za_um, dtype=float)
         self._zb = np.asarray(zb_um, dtype=float)
         self._map = np.asarray(map2d, dtype=float)
         self._metric = metric
         self._ref_col = ref_col
         self._ref_row = ref_row
+        self._maximize = bool(maximize)
+        if mode is not None:
+            for i in range(self.mode_combo.count()):
+                if self.mode_combo.itemData(i) == mode:
+                    self.mode_combo.blockSignals(True)
+                    self.mode_combo.setCurrentIndex(i)
+                    self.mode_combo.blockSignals(False)
+                    break
         self.progress.setValue(self.progress.maximum())
         self._update_marker()
 
     def _selected_indices(self):
         mode = self.mode_combo.currentData()
-        return opt.optimal_indices(self._map, mode=mode,
-                                   ref_col=self._ref_col, ref_row=self._ref_row)
+        return opt.optimal_indices(self._map, mode=mode, ref_col=self._ref_col,
+                                   ref_row=self._ref_row, maximize=self._maximize)
 
     def _update_marker(self):
         if self._map is None:
@@ -227,10 +242,16 @@ class FocusMapWindow(QWidget):
             self.use_btn.setEnabled(False)
         self.ax.set_title(f"Propagation map ({self._metric})  ·  click a point to select it", fontsize=9)
         self.ax.set_xlabel("template z (µm)"); self.ax.set_ylabel("moving z (µm)")
+        # Reuse a SINGLE colorbar across redraws (item 4): update its mappable
+        # instead of adding a new one each time (which stacked colorbars when
+        # focus_check ran repeatedly).
         try:
-            self.fig.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
+            if self._cbar is None:
+                self._cbar = self.fig.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
+            else:
+                self._cbar.update_normal(im)
         except Exception:
-            pass
+            self._cbar = None
         self.canvas.draw_idle()
 
     def _cycle_mode(self, delta):

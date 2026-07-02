@@ -593,11 +593,14 @@ def focus_consistency_map(field_a, field_b, z_a_values, z_b_values,
     return z_a_values, z_b_values, out
 
 
-def optimal_indices(map2d, mode="global", ref_col=None, ref_row=None):
-    """Indices ``(i_col=z_a, j_row=z_b)`` of the optimum (max) of ``map2d``.
+def optimal_indices(map2d, mode="global", ref_col=None, ref_row=None, maximize=True):
+    """Indices ``(i_col=z_a, j_row=z_b)`` of the optimum of ``map2d``.
+
+    ``maximize`` selects whether the optimum is the max (e.g. NCC/SSIM, higher
+    is better) or the min (e.g. an L2/error metric, lower is better).
 
     ``mode``:
-    - ``"global"``   : argmax over the whole map.
+    - ``"global"``   : optimum over the whole map.
     - ``"vs_template"``: best moving z at the template column ``ref_col`` (fix
       template focus -> search the vertical line).
     - ``"vs_moving"``  : best template z at the moving row ``ref_row`` (fix
@@ -607,20 +610,21 @@ def optimal_indices(map2d, mode="global", ref_col=None, ref_row=None):
     """
     if not np.any(np.isfinite(map2d)):
         return None
+    argopt = np.nanargmax if maximize else np.nanargmin
     nrow, ncol = map2d.shape
     if mode == "vs_template" and ref_col is not None:
         col = np.clip(int(ref_col), 0, ncol - 1)
         line = map2d[:, col]
         if not np.any(np.isfinite(line)):
             return None
-        return col, int(np.nanargmax(line))
+        return col, int(argopt(line))
     if mode == "vs_moving" and ref_row is not None:
         row = np.clip(int(ref_row), 0, nrow - 1)
         line = map2d[row, :]
         if not np.any(np.isfinite(line)):
             return None
-        return int(np.nanargmax(line)), row
-    j, i = np.unravel_index(np.nanargmax(map2d), map2d.shape)
+        return int(argopt(line)), row
+    j, i = np.unravel_index(argopt(map2d), map2d.shape)
     return int(i), int(j)
 
 

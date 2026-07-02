@@ -113,9 +113,11 @@ def _action_summary(action):
     if t == "ncc_refine":
         return "Subpixel NCC refinement"
     if t == "focus_check":
+        sense = "max" if action.get("maximize", action.get("metric", "ncc") != "l2") else "min"
         return (f"Focus check (tpl ±{action.get('half_tpl_um', 5):g}/{action.get('step_tpl_nm', 100):g}nm, "
                 f"mov ±{action.get('half_mov_um', 5):g}/{action.get('step_mov_nm', 100):g}nm, "
-                f"{action.get('metric', 'ncc')}, ROI {action.get('roi_frac', 0.5) * 100:g}%)")
+                f"{sense} {action.get('metric', 'ncc')}, {action.get('apply', 'manual')} "
+                f"{action.get('optimum', 'global')}, ROI {action.get('roi_frac', 0.5) * 100:g}%)")
     if t == "save":
         what = action.get("what", "moving")
         if action.get("all_channels", True):
@@ -411,11 +413,28 @@ class FocusingPanel(QWidget):
         self.fc_half_mov = self._spin(0.1, 200, 5.0, " ±movum")
         self.fc_step_mov = self._spin(10, 5000, 100.0, " mov nm")
         self.fc_metric = QComboBox(); self.fc_metric.addItems(["ncc", "l2", "ssim"])
+        # Optimize sense: maximise (ncc/ssim) or minimise (l2/error metric).
+        self.fc_sense = QComboBox(); self.fc_sense.addItems(["maximise", "minimise"])
+        self.fc_sense.setToolTip("Whether the optimum is the max (ncc/ssim) or the min (l2) of the metric.")
+        # Which optimum to jump to after computing the map.
+        self.fc_optimum = QComboBox()
+        for key, label in [("global", "global optimum"),
+                           ("vs_template", "vs template focus"),
+                           ("vs_moving", "vs moving focus")]:
+            self.fc_optimum.addItem(label, key)
+        self.fc_optimum.setToolTip("Which optimum the map jumps to after calculation (auto), or presents (manual).")
+        # Manual = user clicks the map; auto = apply the chosen optimum directly.
+        self.fc_apply = QComboBox(); self.fc_apply.addItems(["manual", "auto"])
+        self.fc_apply.setToolTip("manual: pick on the map. auto: apply the selected optimum automatically.")
         self.fc_roi_pct = QSpinBox(); self.fc_roi_pct.setRange(5, 100); self.fc_roi_pct.setValue(25)
         self.fc_roi_pct.setPrefix("ROI "); self.fc_roi_pct.setSuffix("%")
         self.fc_roi_pct.setToolTip("Centered crop used for the focus map; z is applied full-frame.")
         self.fc_widgets = [self.fc_half_tpl, self.fc_step_tpl,
-                           self.fc_half_mov, self.fc_step_mov, self.fc_metric, self.fc_roi_pct]
+                           self.fc_half_mov, self.fc_step_mov, self.fc_metric,
+                           self.fc_sense, self.fc_optimum, self.fc_apply, self.fc_roi_pct]
+        # Default the optimize sense from the metric (l2 -> minimise, else maximise).
+        self.fc_metric.currentTextChanged.connect(
+            lambda m: self.fc_sense.setCurrentText("minimise" if m == "l2" else "maximise"))
         for w in self.fc_widgets:
             ctrl.addWidget(w)
 
@@ -1146,6 +1165,9 @@ class FocusingPanel(QWidget):
             action = {"type": atype, "metric": self.fc_metric.currentText(),
                       "half_tpl_um": self.fc_half_tpl.value(), "step_tpl_nm": self.fc_step_tpl.value(),
                       "half_mov_um": self.fc_half_mov.value(), "step_mov_nm": self.fc_step_mov.value(),
+                      "maximize": self.fc_sense.currentText() == "maximise",
+                      "optimum": self.fc_optimum.currentData(),
+                      "apply": self.fc_apply.currentText(),
                       "roi_frac": self.fc_roi_pct.value() / 100.0}
             if self._roi is not None:
                 action["roi"] = list(self._roi)
@@ -1548,7 +1570,10 @@ class FocusingPanel(QWidget):
 
         ref_col = int(np.argmin(np.abs(za - item["z_tpl_um"] * 1e-6)))
         ref_row = int(np.argmin(np.abs(zb - item["z_mov_um"] * 1e-6)))
-        win.set_map(za * 1e6, zb * 1e6, map2d, metric, ref_col=ref_col, ref_row=ref_row)
+        maximize = bool(action.get("maximize", metric != "l2"))
+        opt_mode = action.get("optimum", "global")
+        win.set_map(za * 1e6, zb * 1e6, map2d, metric, ref_col=ref_col, ref_row=ref_row,
+                    maximize=maximize, mode=opt_mode)
         if np.any(np.isfinite(map2d)):
             item["corr"] = float(np.nanmax(map2d))
         # Context for click-overlay + "Use optimal". The click overlays the FULL
@@ -1566,9 +1591,19 @@ class FocusingPanel(QWidget):
             return field
         self._fc_ctx = {"lam": lam, "n": n, "px_tpl": px_tpl, "px_mov": px_mov,
                         "align_b": overlay_align_b, "item": item}
-        # During a Run, pause here until the user picks an optimum ('Use optimal')
-        # or closes the map window, before the sequence continues.
-        if self._blocking_run:
+        # Auto: apply the selected optimum (set on the map by set_map) directly and
+        # continue -- no manual click. Manual: pause on the map (during a Run) so the
+        # user clicks / 'Use optimal' before the sequence continues.
+        if action.get("apply", "manual") == "auto":
+            z_tpl_um, z_mov_um = win._peak
+            item["z_tpl_um"] = float(z_tpl_um)
+            item["z_mov_um"] = float(z_mov_um)
+            self._update_row(self.current_index)
+            self._draw_field()
+            self.status_label.setText(
+                f"Focus (auto {opt_mode}, {'max' if maximize else 'min'} {metric}): "
+                f"z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm (applied).")
+        elif self._blocking_run:
             self.status_label.setText("Focus map: pick an optimum ('Use optimal') or close to continue…")
             win.wait_until_closed()
 
