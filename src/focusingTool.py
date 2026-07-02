@@ -118,7 +118,12 @@ def _action_summary(action):
                 f"{action.get('metric', 'ncc')}, ROI {action.get('roi_frac', 0.5) * 100:g}%)")
     if t == "save":
         what = action.get("what", "moving")
-        chan = "all channels" if action.get("all_channels", True) else f"channel {action.get('channel', 0)}"
+        if action.get("all_channels", True):
+            chan = "all wavelengths"
+        elif "wavelength_nm" in action:
+            chan = f"{float(action['wavelength_nm']):g} nm"
+        else:
+            chan = f"channel {action.get('channel', 0)}"
         folder = action.get("folder")
         dest = f"-> {folder} (name+{action.get('suffix', '')})" if folder else "(prompt)"
         return f"Save {what} [{chan}] {dest}"
@@ -421,14 +426,22 @@ class FocusingPanel(QWidget):
 
         # save options
         self.save_what = QComboBox(); self.save_what.addItems(["moving", "template", "both"])
-        self.save_channels = QComboBox(); self.save_channels.addItems(["all channels", "single channel"])
+        self.save_channels = QComboBox()
+        self.save_channels.addItems(["all wavelengths", "single wavelength"])
         self.save_channels.currentIndexChanged.connect(self._update_option_visibility)
-        self.save_channel_idx = QSpinBox(); self.save_channel_idx.setRange(0, 999); self.save_channel_idx.setPrefix("ch ")
+        # For a single-wavelength save, pick a WAVELENGTH (default 670 nm) rather
+        # than a raw channel index; resolved to the nearest channel per file at
+        # save time from the file's wavelengths_nm metadata.
+        self.save_wavelength = QComboBox()
+        self.save_wavelength.setToolTip(
+            "Wavelength to save when 'single wavelength' is selected (multi-λ stacks). "
+            "Resolved to the nearest channel from each file's wavelengths_nm metadata.")
         self.save_folder = QLineEdit(); self.save_folder.setPlaceholderText("output folder (blank = prompt)")
         self.save_suffix = QLineEdit(); self.save_suffix.setPlaceholderText("suffix"); self.save_suffix.setMaximumWidth(120)
         self.save_browse = QPushButton("Browse..."); self.save_browse.clicked.connect(self._browse_save_folder)
-        self.save_widgets = [self.save_what, self.save_channels, self.save_channel_idx,
+        self.save_widgets = [self.save_what, self.save_channels, self.save_wavelength,
                              self.save_folder, self.save_browse, self.save_suffix]
+        self._populate_save_wavelengths()
         for w in self.save_widgets:
             ctrl.addWidget(w)
 
@@ -493,8 +506,8 @@ class FocusingPanel(QWidget):
         self._set_visible(self.lf_widgets, atype == "live_feedback")
         self._set_visible(self.save_widgets, atype == "save")
         if atype == "save":
-            # The single-channel index spin is only relevant for "single channel".
-            self.save_channel_idx.setVisible(self.save_channels.currentText() == "single channel")
+            # The wavelength picker only matters for "single wavelength".
+            self.save_wavelength.setVisible(self.save_channels.currentText() == "single wavelength")
 
     def _browse_save_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -750,6 +763,27 @@ class FocusingPanel(QWidget):
             return [f"{wl[i]:g} nm" for i in range(n_frames)]
         return [f"frame {i}" for i in range(max(1, n_frames))]
 
+    DEFAULT_SAVE_WL_NM = 670.0
+
+    def _populate_save_wavelengths(self):
+        """Fill the single-wavelength save picker from the current moving row's
+        wavelengths_nm metadata (default 670 nm). Falls back to just 670 nm when
+        no multi-wavelength metadata is available; the choice is stored as a
+        wavelength (float) and resolved to the nearest channel per file at save."""
+        wl = None
+        if 0 <= self.current_index < len(self.rows):
+            wl = self.rows[self.current_index].get("wl_mov")
+        prev = self.save_wavelength.currentData()  # keep the user's pick if still present
+        self.save_wavelength.blockSignals(True)
+        self.save_wavelength.clear()
+        wls = [float(w) for w in wl] if wl else [self.DEFAULT_SAVE_WL_NM]
+        for w in wls:
+            self.save_wavelength.addItem(f"{w:g} nm", float(w))
+        target = prev if prev is not None else self.DEFAULT_SAVE_WL_NM
+        nearest = min(range(len(wls)), key=lambda i: abs(wls[i] - target))
+        self.save_wavelength.setCurrentIndex(nearest)
+        self.save_wavelength.blockSignals(False)
+
     def _populate_channel_combo(self, which, item):
         combo = self.tpl_chan_combo if which == "template" else self.mov_chan_combo
         n_frames = item["n_frames_tpl"] if which == "template" else item["n_frames_mov"]
@@ -763,6 +797,8 @@ class FocusingPanel(QWidget):
         # A single-channel file leaves nothing to scroll; disable to signal that.
         combo.setEnabled(combo.count() > 1)
         combo.blockSignals(False)
+        if which == "moving":
+            self._populate_save_wavelengths()  # reflect this file's wavelengths_nm
 
     def _on_channel_changed(self, which):
         if not (0 <= self.current_index < len(self.rows)):
@@ -1117,8 +1153,10 @@ class FocusingPanel(QWidget):
             action = {"type": atype, "enabled": self.lf_enabled.currentText() == "on"}
         elif atype == "save":
             action = {"type": atype, "what": self.save_what.currentText(),
-                      "all_channels": self.save_channels.currentText() == "all channels",
-                      "channel": self.save_channel_idx.value()}
+                      "all_channels": self.save_channels.currentText() == "all wavelengths",
+                      "wavelength_nm": float(self.save_wavelength.currentData()
+                                             if self.save_wavelength.currentData() is not None
+                                             else self.DEFAULT_SAVE_WL_NM)}
             folder = self.save_folder.text().strip()
             if folder:
                 action["folder"] = folder
@@ -1166,7 +1204,7 @@ class FocusingPanel(QWidget):
              "half_mov_um": 20.0, "step_mov_nm": 1000.0},  # 10x moving
             kp(),                              # rotation-blocked keypoints
             {"type": "save", "what": "both", "all_channels": True,
-             "channel": 0, "suffix": "_aligned"},  # folder prompted at save
+             "wavelength_nm": 670.0, "suffix": "_aligned"},  # folder prompted at save
         ]
 
     def _load_default_sequence(self):
@@ -1651,10 +1689,19 @@ class FocusingPanel(QWidget):
         px = px_mov if which == "moving" else px_tpl
         out_shape = self._tpl_field.shape if self._tpl_field is not None else None
 
+        all_wl = opt.read_wavefront_wavelengths(path)
         if action.get("all_channels", True):
             channels = list(range(max(1, n_frames)))
+        elif "wavelength_nm" in action and all_wl and len(all_wl) == n_frames:
+            # Resolve the requested wavelength (default 670 nm) to the nearest
+            # channel of THIS file, so multi-λ stacks save the right band even
+            # when channel ordering/count differs across files.
+            target = float(action["wavelength_nm"])
+            channels = [min(range(n_frames), key=lambda i: abs(all_wl[i] - target))]
         else:
-            channels = [min(int(action.get("channel", 0)), max(0, n_frames - 1))]
+            # No usable metadata (or legacy 'channel' action): fall back to index.
+            idx = int(action.get("channel", 0))
+            channels = [min(max(idx, 0), max(0, n_frames - 1))]
 
         frames = []
         for fi in channels:
@@ -1670,12 +1717,16 @@ class FocusingPanel(QWidget):
             frames.append(np.stack([phase, amp], axis=0))  # (2[phase,amp], H, W)
         stack = np.moveaxis(np.stack(frames, axis=0), 1, -1)  # (N, H, W, C) for save_stack
 
-        all_wl = opt.read_wavefront_wavelengths(path)
-        if all_wl and len(all_wl) >= len(channels):
-            wavelengths = tuple(all_wl[i] for i in channels) if not action.get("all_channels", True) else tuple(all_wl)
+        if all_wl and len(all_wl) >= max(channels) + 1:
+            wavelengths = tuple(all_wl[i] for i in channels)
         else:
             wavelengths = (self.wavelength_nm.value(),)
-        chan_tag = "" if action.get("all_channels", True) else f"_ch{channels[0]}"
+        if action.get("all_channels", True):
+            chan_tag = ""
+        elif all_wl and len(all_wl) == n_frames:
+            chan_tag = f"_{all_wl[channels[0]]:g}nm"
+        else:
+            chan_tag = f"_ch{channels[0]}"
         out_path = str(out_dir / f"{Path(path).stem}{suffix}{chan_tag}.tif")
         metas = {"optics": self._current_optics(), "target": which, "z_um": z_um,
                  "global_matrix": (self._global_matrix.tolist() if which == "moving"
