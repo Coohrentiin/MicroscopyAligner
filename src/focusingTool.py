@@ -689,6 +689,10 @@ class FocusingPanel(QWidget):
         self.current_index = row
         if item.get("optics"):
             self._apply_optics_to_widgets(item["optics"])
+        # Set the high-contrast overlay colormap ONCE when a row is loaded; do NOT
+        # re-force it on every step afterwards (#2 -- respect the user's choice).
+        self.aligner.template_color.setCurrentText(ALIGN_CMAP)
+        self.aligner.moving_color.setCurrentText(ALIGN_CMAP)
         self._populate_channel_combo("template", item)
         self._populate_channel_combo("moving", item)
         self._global_matrix = (np.array(item["global_matrix"], dtype=float)
@@ -1185,13 +1189,15 @@ class FocusingPanel(QWidget):
         sub = self._subtract_median()
         tpl_phase = opt.unwrapped_phase(tpl_prop, subtract_median=sub)
         mov_phase = opt.unwrapped_phase(mov_prop, subtract_median=sub)
-        self.aligner.template_color.setCurrentText(ALIGN_CMAP)
-        self.aligner.moving_color.setCurrentText(ALIGN_CMAP)
+        # Colormap is set once at row load (_send_to_window); don't re-force it (#2).
         self.aligner.set_template_array(tpl_phase, item["template_path"])
-        # Restore any in-progress global matrix so the aligner re-applies it.
-        if self._global_matrix is not None:
-            self.aligner.current_transform = tf.AffineTransform(matrix=self._global_matrix)
-            self.aligner.transform_controls.set_values_from_transform(self._global_matrix)
+        # Seed the aligner transform from the in-progress global matrix. When there
+        # is none yet (e.g. only a refocus happened), reset to IDENTITY so the next
+        # step (e.g. ncc_refine) starts from the freshly-refocused moving rather
+        # than stale slider/transform values from a previous step or row (#1).
+        gm = self._global_matrix if self._global_matrix is not None else np.eye(3)
+        self.aligner.current_transform = tf.AffineTransform(matrix=gm)
+        self.aligner.transform_controls.set_values_from_transform(gm)
         self.aligner.set_moving_array(mov_phase, item["moving_path"])
         # Also hand the COMPLEX propagated fields to the aligner so the main
         # window's "Observable" combo works while running a sequence (#1).
@@ -1506,7 +1512,6 @@ class FocusingPanel(QWidget):
             mov = ctx["align_b"](opt.propagate_asm(self._mov_field, z_mov_um * 1e-6, ctx["lam"], ctx["px_mov"], n=ctx["n"]))
             a = self.aligner
             row = self.rows[self.current_index]
-            a.template_color.setCurrentText(ALIGN_CMAP); a.moving_color.setCurrentText(ALIGN_CMAP)
             # Render the panel's chosen observable (e.g. PHASE) directly so the
             # click shows the right channel immediately -- no stale-toggle needed
             # (bug #1). Pure display: doesn't mutate the panel's complex fields.
@@ -1911,8 +1916,8 @@ class _PanelDistanceController:
         mov_in = opt.center_crop(p._mov_field, roi_frac)
         tpl = opt.propagate_asm(tpl_in, z_tpl_um * 1e-6, lam, px_tpl, n=n)
         mov = align_b(opt.propagate_asm(mov_in, z_mov_um * 1e-6, lam, px_mov, n=n))
-        if force_colormap:
-            a.template_color.setCurrentText(ALIGN_CMAP); a.moving_color.setCurrentText(ALIGN_CMAP)
+        # Colormap set once at row load; don't re-force here (#2). force_colormap kept
+        # for API compat but no longer changes the user's choice.
         a.template_image = p._field_to_observable(tpl)
         a.transform_controls.set_template_shape(a.template_image.shape)
         a.moving_image = p._field_to_observable(mov); a.transformed_image = a.moving_image
