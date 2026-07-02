@@ -37,27 +37,48 @@ from natsort import natsort_keygen
 from skimage import transform as tf
 
 _NATKEY = natsort_keygen()
-# Sequence token like ``BDD_045``: a letter token followed by ``_<digits>``.
-_SEQ_RE = re.compile(r'([A-Za-z]+)_(\d+)')
+# Default sequence pattern: a literal ``BDD`` anchor + one number group (the
+# common single-index case). The user can edit this regex; its captured groups
+# form the match/sort key so differing-prefix/suffix acquisitions with the same
+# sequence associate (e.g. ``*BDD_(\d+)_(\d+)`` keys on both numbers).
+DEFAULT_SEQ_PATTERN = r"BDD_(\d+)"
 
 
-def sequence_sorted(paths):
-    """Sort files so differing-prefix acquisitions with the same sequence number
-    line up on the same row.
+def sequence_key(path, pattern=DEFAULT_SEQ_PATTERN):
+    """Match key for a file from a regex ``pattern`` (searched in the stem).
 
-    Keys on the LAST ``<letters>_<digits>`` group of each filename stem (e.g.
-    ``BDD_045`` -> token ``BDD`` number ``45``), so ``PDHM_10x_BDD_045_0`` and
-    ``DHM_20x_BDD_045_0`` sort together (NNN=045) despite different prefixes.
-    Files with no such token fall back to natural order after those that do; ties
-    break on the natural sort of the full name.
+    The tuple of the regex's captured groups is the key; each group is coerced to
+    ``int`` when it is all digits (so ``045`` sorts numerically and matches ``45``
+    only by value... note ``int('045')==45``), else kept as a lowercased string.
+    Returns ``None`` when the pattern doesn't match (unkeyed).
+    """
+    if not pattern:
+        return None
+    try:
+        m = re.search(pattern, Path(path).stem)
+    except re.error:
+        return None
+    if not m:
+        return None
+    groups = m.groups() if m.groups() else (m.group(0),)
+    return tuple(int(g) if g is not None and g.isdigit() else (g or "").lower()
+                for g in groups)
+
+
+def sequence_sorted(paths, pattern=DEFAULT_SEQ_PATTERN):
+    """Sort files so acquisitions with the same sequence key line up on one row.
+
+    Files matching ``pattern`` sort first, by their captured key; unmatched files
+    fall back to natural order after them. Ties break on the natural sort of the
+    full name, so e.g. ``…BDD_045_0`` and ``…BDD_045_1`` keep a stable order.
     """
     def key(p):
-        stem = Path(p).stem
-        matches = _SEQ_RE.findall(stem)
-        if matches:
-            tok, num = matches[-1]
-            return (0, tok.upper(), int(num), _NATKEY(stem))
-        return (1, "", 0, _NATKEY(stem))
+        k = sequence_key(p, pattern)
+        if k is None:
+            return (1, (), _NATKEY(Path(p).stem))
+        # Natural-sort the key's string form so heterogeneous group types (int vs
+        # str across files) stay comparable while numbers still order numerically.
+        return (0, _NATKEY("_".join(str(g) for g in k)), _NATKEY(Path(p).stem))
     return sorted(paths, key=key)
 
 from PySide6.QtWidgets import (
@@ -320,9 +341,29 @@ class FocusingPanel(QWidget):
         sec.addStretch()
         v.addLayout(sec)
 
+        # Sequence-matching pattern (regex): captured groups form the key that
+        # associates template/moving/secondary files across differing prefixes.
+        pat_row = QHBoxLayout()
+        pat_row.addWidget(QLabel("Match pattern (regex):"))
+        self.seq_pattern = QLineEdit(DEFAULT_SEQ_PATTERN)
+        self.seq_pattern.setToolTip(
+            "Regex searched in each filename (stem). Its captured groups form the "
+            "match/sort key, so files sharing that key line up on one row.\n"
+            r"E.g. BDD_(\d+)_(\d+) matches PDHM_10x_BDD_045_13_focused and "
+            "DHM_20x_BDD_045_13 on key (045, 13).")
+        pat_row.addWidget(self.seq_pattern, stretch=1)
+        self.folder_mode = QCheckBox("Browse by folder (auto-match to templates)")
+        self.folder_mode.setToolTip(
+            "When on, 'Browse Movings' / 'Secondary' ask for a FOLDER and fill each "
+            "already-loaded template row with the file whose pattern key matches "
+            "that row's template. Rows with no match are left blank.")
+        pat_row.addWidget(self.folder_mode)
+        v.addLayout(pat_row)
+
         hint = QLabel("Browse fills the column downward from the selected row, sorted by the "
-                      "filename sequence (…BDD_NNN…) so template/moving/secondaries with the "
-                      "same NNN line up on one row (adding rows). "
+                      "match pattern's captured key so template/moving/secondaries with the "
+                      "same key line up on one row (adding rows). Tick 'Browse by folder' to "
+                      "auto-match a folder's files to the loaded template rows. "
                       "Click a row to make it the working sample for refocus / actions. "
                       "Secondary images are NOT displayed; at save they get the same transform "
                       "(moving: propagation+matrix+distortion; template: propagation) as the primary.")
@@ -628,16 +669,96 @@ class FocusingPanel(QWidget):
         self.table.setCurrentCell(row, 0)
         self._send_to_window(row)
 
-    def _browse_column(self, which):
-        paths, _ = QFileDialog.getOpenFileNames(self, f"Select {which} WF files", "", WF_FILTER)
+    def _seq_pattern(self):
+        return self.seq_pattern.text().strip() or DEFAULT_SEQ_PATTERN
+
+    def _folder_wf_files(self, folder):
+        """List wavefront TIFFs directly in ``folder`` (non-recursive)."""
+        d = Path(folder)
+        files = [str(p) for p in d.iterdir()
+                 if p.is_file() and p.suffix.lower() in (".tif", ".tiff")]
+        return sequence_sorted(files, self._seq_pattern())
+
+    def _match_folder_to_templates(self, folder):
+        """Map each template row to the folder file whose pattern key matches it.
+
+        Returns ``(matches, unmatched_rows, n_templates)`` where ``matches`` is
+        ``{row_index: path}`` for rows whose template key found a folder file.
+        Rows without a template, or with no matching file, are left out (blank)."""
+        pattern = self._seq_pattern()
+        by_key = {}
+        for f in self._folder_wf_files(folder):
+            k = sequence_key(f, pattern)
+            if k is not None:
+                by_key.setdefault(k, f)  # first file wins on duplicate keys
+        matches, unmatched = {}, []
+        n_templates = 0
+        for r, row in enumerate(self.rows):
+            tpl = row.get("template_path")
+            if not tpl:
+                continue
+            n_templates += 1
+            k = sequence_key(tpl, pattern)
+            if k is not None and k in by_key:
+                matches[r] = by_key[k]
+            else:
+                unmatched.append(r)
+        return matches, unmatched, n_templates
+
+    def _pick_paths(self, which, secondary=False):
+        """Return the (path -> row) plan for a browse. In folder mode, match a
+        chosen folder's files to the loaded template rows; else multi-select
+        files and fill down from the current row. Returns a ``{row: path}`` dict
+        (adding rows as needed) or ``None`` if cancelled/empty."""
+        label = f"secondary {which}" if secondary else which
+        # Folder mode matches to loaded templates; it needs an anchor, so for the
+        # TEMPLATE column itself there is nothing to match against -> just load all
+        # WF files in the folder (sorted, fill down from the current row).
+        anchor_to_templates = not (which == "template" and not secondary)
+        if self.folder_mode.isChecked():
+            folder = QFileDialog.getExistingDirectory(self, f"Select {label} folder")
+            if not folder:
+                return None
+            if anchor_to_templates:
+                matches, unmatched, n_tpl = self._match_folder_to_templates(folder)
+                if n_tpl == 0:
+                    QMessageBox.information(self, "Folder match",
+                                            "Load templates first: folder mode matches files to template rows.")
+                    return None
+                self.status_label.setText(
+                    f"{label}: matched {len(matches)}/{n_tpl} template row(s) "
+                    f"({len(unmatched)} unmatched, left blank). Pattern: {self._seq_pattern()}")
+                return dict(matches)
+            # Template folder load: take every WF file, fill down from current row.
+            files = self._folder_wf_files(folder)
+            if not files:
+                return None
+            start = max(0, self.table.currentRow())
+            plan = {}
+            for i, path in enumerate(files):
+                r = start + i
+                if r >= len(self.rows):
+                    self._add_row(refresh=False)
+                plan[r] = path
+            return plan
+        paths, _ = QFileDialog.getOpenFileNames(self, f"Select {label} WF files", "", WF_FILTER)
         if not paths:
-            return
-        paths = sequence_sorted(paths)
+            return None
+        paths = sequence_sorted(paths, self._seq_pattern())
         start = max(0, self.table.currentRow())
+        plan = {}
         for i, path in enumerate(paths):
             r = start + i
             if r >= len(self.rows):
                 self._add_row(refresh=False)
+            plan[r] = path
+        return plan
+
+    def _browse_column(self, which):
+        plan = self._pick_paths(which)
+        if not plan:
+            return
+        for r, path in plan.items():
             try:
                 n_frames, wl = self._wf_meta(path)
             except Exception:
@@ -651,23 +772,19 @@ class FocusingPanel(QWidget):
         self._refresh_table()
 
     def _browse_secondary(self, which):
-        """Attach secondary image(s); multi-select natsort-fills DOWN across rows
-        (one per row, adding rows as needed), like 'Browse Movings...' (#3)."""
-        paths, _ = QFileDialog.getOpenFileNames(self, f"Select secondary {which} WF files", "", WF_FILTER)
-        if not paths:
+        """Attach secondary image(s). File mode fills DOWN from the current row;
+        folder mode matches each template row by the sequence pattern."""
+        plan = self._pick_paths(which, secondary=True)
+        if not plan:
             return
-        paths = sequence_sorted(paths)
         key = "secondary_moving_paths" if which == "moving" else "secondary_template_paths"
-        start = max(0, self.table.currentRow())
-        for i, path in enumerate(paths):
-            r = start + i
-            if r >= len(self.rows):
-                self._add_row(refresh=False)
+        for r, path in plan.items():
             self.rows[r].setdefault(key, [])
             self.rows[r][key].append(path)
         self._refresh_table()
-        self.status_label.setText(
-            f"Added {len(paths)} secondary {which} image(s) down from row {start + 1}.")
+        if not self.folder_mode.isChecked():
+            self.status_label.setText(
+                f"Added {len(plan)} secondary {which} image(s).")
 
     def _clear_secondaries(self):
         row = self.table.currentRow()
