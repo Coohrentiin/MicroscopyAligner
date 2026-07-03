@@ -1748,7 +1748,12 @@ class FocusingPanel(QWidget):
                 f"Focus (auto {opt_mode}, {'max' if maximize else 'min'} {metric}): "
                 f"z_tpl={z_tpl_um:.2f} µm, z_mov={z_mov_um:.2f} µm (applied).")
         elif self._blocking_run:
-            self.status_label.setText("Focus map: pick an optimum ('Use optimal') or close to continue…")
+            # Go to the user's chosen optimum as if they clicked it (selects it,
+            # previews the overlay), then wait so they can accept ('Use optimal')
+            # or pick a different point.
+            win.select_optimum()
+            self.status_label.setText(
+                f"Focus map at {opt_mode} optimum — 'Use optimal' to accept, or click another point.")
             win.wait_until_closed()
 
     def _ensure_focus_map_window(self, FocusMapWindow, item):

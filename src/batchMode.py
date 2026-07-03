@@ -254,6 +254,26 @@ class FocusMapWindow(QWidget):
             self._cbar = None
         self.canvas.draw_idle()
 
+    def select_optimum(self):
+        """Select the current optimum as if the user had clicked it on the map:
+        set it as the active selection, draw the selection marker, and fire the
+        ``on_cell`` preview. Used when the map pops up during a sequence Run so it
+        lands on the user's chosen optimum without a manual click. Returns the
+        selected ``(z_tpl_um, z_mov_um)`` or ``None`` if the map is degenerate."""
+        idx = self._selected_indices()
+        if idx is None:
+            return None
+        i_col, j_row = idx
+        self._peak = (float(self._za[i_col]), float(self._zb[j_row]))
+        self._draw_selection_marker()
+        self.info.setText(f"Optimum ({self.mode_combo.currentText()}, {self._metric}): "
+                          f"z_tpl={self._peak[0]:.2f} µm, z_mov={self._peak[1]:.2f} µm "
+                          f"(auto-selected; 'Use optimal' to apply)")
+        self.use_btn.setEnabled(True)
+        if self._on_cell is not None:
+            self._on_cell(self._peak[0], self._peak[1])
+        return self._peak
+
     def _cycle_mode(self, delta):
         n = self.mode_combo.count()
         self.mode_combo.setCurrentIndex((self.mode_combo.currentIndex() + delta) % n)
