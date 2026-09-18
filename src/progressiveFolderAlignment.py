@@ -16,13 +16,23 @@ Workflow
    to the main window for manual alignment.
 3. Align a few items and mark each as an **anchor** (its final matrix is stored).
 4. Build a reusable **action sequence** (set_matrix / auto_keypoints /
-   cross_correlation / reset), like Batch Mode.
+   cross_correlation / reset), like Batch Mode.  Headless ``auto_keypoints``
+   exposes the same constraints as Batch Mode: lock rotation and/or scale (a
+   rigid / similarity fit) plus an optional residual distortion model.
 5. **Propagate**: for every non-anchor item, set the transform to a prealignment
    matrix interpolated between the two nearest anchors by list index
    (nearest-anchor copy outside the anchor range -- no extrapolation), then
    replay the action sequence on top to refine.
 6. Review per-item status + correlation score, fix outliers, then export aligned
-   items + per-item matrices.
+   items + per-item matrices (``matrices.json``).  Items the wavefront loader can
+   read -- multi-frame stacks and single-frame 2-channel files alike -- are
+   written back as ImageJ stacks keeping phase + amplitude, as Edit > "Apply
+   transform to a ImageJ stack" does; the "Save as" selector can force the stack
+   or flat writer instead.
+
+A previously exported ``matrices.json`` can be re-imported ("Load matrices.json")
+to restore per-item transforms as anchors, optionally populating the item list
+from the names it holds.
 
 The prealignment is interpolated on the **center-referenced display params**
 (scale / rotation / tx / ty) produced by
@@ -86,11 +96,23 @@ def representative_frame(path):
     Tries the wavefront-stack loader first (frame 0, phase channel); falls back
     to :func:`load_imgfile` for plain png/jpg/npy that it cannot read.
     """
+    repr2d, n_frames, _ = probe_item(path)
+    return repr2d, n_frames
+
+
+def probe_item(path):
+    """Return ``(repr2d, n_frames, is_wavefront)`` for a folder item.
+
+    ``is_wavefront`` is True when :func:`load_wavefront_tif` can read the file,
+    i.e. it carries a size-2 (phase, amplitude) channel axis -- including
+    **single-frame** ``(H, W, 2)`` / ``(2, H, W)`` files, which still have to be
+    written back through the stack pipeline to keep both channels.
+    """
     try:
         phase, _amp, n_frames = load_wavefront_tif(path, frame_index=0)
-        return phase.astype(np.float32), int(n_frames)
+        return phase.astype(np.float32), int(n_frames), True
     except Exception:
-        return _to_2d(load_imgfile(path)).astype(np.float32), 1
+        return _to_2d(load_imgfile(path)).astype(np.float32), 1, False
 
 
 def correlation_score(template2d, warped2d):
@@ -167,8 +189,9 @@ class ProgressiveFolderPanel(QWidget):
 
     Data model
     ----------
-    ``self.images``: list of dicts ``{path, n_frames, matrix(list|None),
-    matrix_rel(list|None), is_anchor(bool), status, corr}`` in natsorted order.
+    ``self.images``: list of dicts ``{path, n_frames, is_wavefront(bool),
+    matrix(list|None), matrix_rel(list|None), is_anchor(bool), status, corr}``
+    in natsorted order.
     ``matrix`` is the **global** transform (into the first-image / template
     frame, what export & display use); ``matrix_rel`` is the **relative**
     transform to the per-image reference and is only meaningful in sliding mode.
@@ -371,7 +394,16 @@ class ProgressiveFolderPanel(QWidget):
         self.ak_detector = QComboBox(); self.ak_detector.addItems(["AKAZE", "KAZE", "SIFT", "ORB", "BRISK"])
         self.ak_matcher = QComboBox(); self.ak_matcher.addItems(["Brute Force", "FLANN"])
         self.ak_ransac = QDoubleSpinBox(); self.ak_ransac.setRange(0.5, 20.0); self.ak_ransac.setValue(5.0); self.ak_ransac.setPrefix("RANSAC ")
-        self.ak_headless_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac]
+        # Constraints (rigid: lock rotation and/or scale) + optional residual
+        # distortion, mirroring Batch Mode's auto_keypoints options.
+        self.ak_lock_rotation = QCheckBox("Lock rotation")
+        self.ak_lock_scale = QCheckBox("Lock scale")
+        self.ak_use_distortion = QCheckBox("Distortion")
+        self.ak_use_distortion.toggled.connect(self._update_option_visibility)
+        self.ak_distortion_model = QComboBox(); self.ak_distortion_model.addItems(["tps", "poly", "radial", "piecewise"])
+        self.ak_headless_widgets = [self.ak_detector, self.ak_matcher, self.ak_ransac,
+                                    self.ak_lock_rotation, self.ak_lock_scale,
+                                    self.ak_use_distortion, self.ak_distortion_model]
         for w in self.ak_headless_widgets:
             ctrl.addWidget(w)
 
@@ -403,11 +435,27 @@ class ProgressiveFolderPanel(QWidget):
         export.setStyleSheet("QPushButton { background-color: #FF9800; }")
         export.clicked.connect(self._export)
         run_row.addWidget(export)
+        run_row.addWidget(QLabel("Save as:"))
+        self.save_format = QComboBox()
+        self.save_format.addItem("Auto (keep input layout)", "auto")
+        self.save_format.addItem("ImageJ stack (phase+amp)", "stack")
+        self.save_format.addItem("Flat 2-D (phase only)", "flat")
+        self.save_format.setToolTip(
+            "Auto: multi-channel / multi-frame wavefront items are written back as "
+            "ImageJ stacks (phase+amplitude, all frames), flat images stay flat.\n"
+            "ImageJ stack: force the stack writer for every wavefront item.\n"
+            "Flat 2-D: write only the warped phase channel of frame 0.")
+        run_row.addWidget(self.save_format)
         run_row.addStretch()
         save_cfg = QPushButton("Save Config"); save_cfg.clicked.connect(self._save_config)
         load_cfg = QPushButton("Load Config"); load_cfg.clicked.connect(self._load_config)
+        load_mat = QPushButton("Load matrices.json")
+        load_mat.setToolTip("Re-import per-item matrices exported by a previous run "
+                            "(matched by file name).")
+        load_mat.clicked.connect(self._load_matrices)
         run_row.addWidget(save_cfg)
         run_row.addWidget(load_cfg)
+        run_row.addWidget(load_mat)
         v.addLayout(run_row)
 
         self._update_option_visibility()
@@ -423,7 +471,10 @@ class ProgressiveFolderPanel(QWidget):
         self._set_visible(self.matrix_spins, atype == "set_matrix")
         is_ak = atype == "auto_keypoints"
         self.ak_use_dialog.setVisible(is_ak)
-        self._set_visible(self.ak_headless_widgets, is_ak and not self.ak_use_dialog.isChecked())
+        headless = is_ak and not self.ak_use_dialog.isChecked()
+        self._set_visible(self.ak_headless_widgets, headless)
+        # The distortion model combo only matters when distortion is on.
+        self.ak_distortion_model.setVisible(headless and self.ak_use_distortion.isChecked())
 
     # ------------------------------------------------------------ load actions
     def _load_template(self):
@@ -461,11 +512,12 @@ class ProgressiveFolderPanel(QWidget):
             if progress.wasCanceled():
                 break
             try:
-                _repr, n_frames = representative_frame(p)
+                _repr, n_frames, is_wf = probe_item(p)
             except Exception:
-                n_frames = 1
+                n_frames, is_wf = 1, False
             self.images.append({
-                "path": p, "n_frames": n_frames, "matrix": None, "matrix_rel": None,
+                "path": p, "n_frames": n_frames, "is_wavefront": is_wf,
+                "matrix": None, "matrix_rel": None,
                 "is_anchor": False, "status": self.STATUS_PENDING, "corr": None,
             })
             progress.setValue(i + 1)
@@ -483,6 +535,8 @@ class ProgressiveFolderPanel(QWidget):
             name = Path(item["path"]).name
             if item["n_frames"] > 1:
                 name += f"  [stack ×{item['n_frames']}]"
+            elif item.get("is_wavefront"):
+                name += "  [wavefront 2ch]"
             cells = [
                 name,
                 item["status"],
@@ -608,8 +662,17 @@ class ProgressiveFolderPanel(QWidget):
         if t == "auto_keypoints":
             if action.get("dialog", False):
                 return "Auto keypoint detection (dialog)"
+            extra = []
+            if action.get("lock_rotation"):
+                extra.append("lock rot")
+            if action.get("lock_scale"):
+                extra.append("lock scale")
+            if action.get("distortion_model"):
+                extra.append(f"distortion {action['distortion_model']}")
+            extra_txt = (", " + ", ".join(extra)) if extra else ""
             return (f"Auto keypoint detection (headless: {action.get('detector', 'AKAZE')} / "
-                    f"{action.get('matcher', 'Brute Force')}, RANSAC={action.get('ransac_threshold', 5.0):g})")
+                    f"{action.get('matcher', 'Brute Force')}, "
+                    f"RANSAC={action.get('ransac_threshold', 5.0):g}{extra_txt})")
         return ACTION_LABELS.get(t, t)
 
     def _add_action(self):
@@ -623,7 +686,11 @@ class ProgressiveFolderPanel(QWidget):
             if not action["dialog"]:
                 action.update({"detector": self.ak_detector.currentText(),
                                "matcher": self.ak_matcher.currentText(),
-                               "ransac_threshold": self.ak_ransac.value()})
+                               "ransac_threshold": self.ak_ransac.value(),
+                               "lock_rotation": self.ak_lock_rotation.isChecked(),
+                               "lock_scale": self.ak_lock_scale.isChecked(),
+                               "distortion_model": (self.ak_distortion_model.currentText()
+                                                    if self.ak_use_distortion.isChecked() else None)})
         else:
             action = {"type": atype}
         self.actions.append(action)
@@ -666,7 +733,10 @@ class ProgressiveFolderPanel(QWidget):
                     matcher=action.get("matcher", "Brute Force"),
                     distance_ratio=action.get("distance_ratio", 0.75),
                     use_ransac=action.get("use_ransac", True),
-                    ransac_threshold=action.get("ransac_threshold", 5.0))
+                    ransac_threshold=action.get("ransac_threshold", 5.0),
+                    lock_rotation=action.get("lock_rotation", False),
+                    lock_scale=action.get("lock_scale", False),
+                    distortion_model=action.get("distortion_model"))
         elif t == "cross_correlation":
             a.optimize_phase_correlation()
         elif t == "reset":
@@ -899,6 +969,22 @@ class ProgressiveFolderPanel(QWidget):
         self.plot_canvas.draw_idle()
 
     # ----------------------------------------------------------------- export
+    def _save_as_stack(self, item):
+        """Whether ``item`` should be written through the ImageJ stack writer.
+
+        Auto (default): any item the wavefront loader can read -- multi-frame
+        stacks *and* single-frame 2-channel wavefronts -- so both phase and
+        amplitude survive the round trip, exactly like Edit > "Apply transform
+        to a ImageJ stack". Flat png/jpg/npy items always take the flat path.
+        """
+        mode = self.save_format.currentData()
+        if mode == "flat":
+            return False
+        is_wf = bool(item.get("is_wavefront", item.get("n_frames", 1) > 1))
+        if mode == "stack":
+            return is_wf
+        return is_wf or item.get("n_frames", 1) > 1
+
     def _export(self):
         if not self.template_path:
             QMessageBox.warning(self, "Progressive Folder", "Load a template first.")
@@ -928,8 +1014,9 @@ class ProgressiveFolderPanel(QWidget):
             matrix = np.array(item["matrix"], dtype=float)
             self.aligner.current_transform = tf.AffineTransform(matrix=matrix)
             matrices[Path(item["path"]).name] = matrix.tolist()
-            if item["n_frames"] > 1:
-                # Stack: warp every phase+amp frame via the existing pipeline.
+            if self._save_as_stack(item):
+                # Wavefront: warp every phase+amp frame via the existing stack
+                # pipeline, which preserves the ImageJ channel layout on write.
                 self.aligner.export_stack_to_folder(item["path"], str(out_dir), "_aligned")
             else:
                 # Flat image: set the moving image, then reuse save_image_to_folder.
@@ -949,6 +1036,159 @@ class ProgressiveFolderPanel(QWidget):
                                f"Exported {len(matrices)} item(s) to {out_dir.name}.")
 
     # ------------------------------------------------------------ persistence
+    def _load_matrices(self):
+        """Re-import a ``matrices.json`` written by a previous export.
+
+        The file maps ``<file name> -> 3x3 global matrix``. Items are matched by
+        file name (the export key), falling back to the stem so a run exported
+        with a ``_aligned`` suffix still matches. Matched items become anchors
+        holding that global matrix, so Propagate can interpolate from them.
+
+        When no item is loaded yet but every key resolves next to the json (or in
+        a folder the user picks), the matched files are loaded as the item list.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load matrices.json", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("expected a {name: matrix} object")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load matrices: {e}")
+            return
+
+        # Accept a full config too (it carries an "images" list instead).
+        if "images" in data and isinstance(data.get("images"), list):
+            QMessageBox.information(
+                self, "Progressive Folder",
+                "This file looks like a full progressive config; use 'Load Config'.")
+            return
+
+        matrices = {}
+        for name, m in data.items():
+            try:
+                arr = np.array(m, dtype=float)
+            except Exception:
+                continue
+            if arr.shape == (3, 3):
+                matrices[str(name)] = arr
+        if not matrices:
+            QMessageBox.warning(self, "Progressive Folder",
+                                "No 3x3 matrices found in that file.")
+            return
+
+        if not self.images:
+            self._adopt_matrix_files(Path(path), matrices)
+            if not self.images:
+                return
+
+        # name -> matrix, plus a stem-keyed fallback for suffixed exports.
+        by_name = dict(matrices)
+        by_stem = {}
+        for name, arr in matrices.items():
+            by_stem.setdefault(Path(name).stem, arr)
+
+        n_matched, n_missed = 0, []
+        for i, item in enumerate(self.images):
+            item_name = Path(item["path"]).name
+            arr = by_name.get(item_name)
+            if arr is None:
+                arr = by_stem.get(Path(item_name).stem)
+            if arr is None:
+                n_missed.append(item_name)
+                continue
+            item["matrix"] = arr.tolist()
+            # Imported matrices are global; the relative transform is only
+            # meaningful in sliding mode, so derive it from the reference.
+            item["matrix_rel"] = self._decompose_relative(i, arr).tolist()
+            item["is_anchor"] = True
+            item["status"] = self.STATUS_ANCHOR
+            item["corr"] = self._score_item(item, arr)
+            n_matched += 1
+
+        self._refresh_table()
+        self._refresh_plot()
+        self._update_status()
+        if 0 <= self.current_index < len(self.images):
+            self._update_thumbnail(self.current_index)
+        msg = f"Imported {n_matched} matrix/matrices from {Path(path).name}."
+        if n_missed:
+            msg += f"  {len(n_missed)} item(s) unmatched (e.g. {n_missed[0]})."
+        self.status_label.setText(msg)
+        QMessageBox.information(self, "Progressive Folder", msg)
+
+    def _adopt_matrix_files(self, json_path, matrices):
+        """Populate the item list from the names in a matrices.json.
+
+        Looks for the named files beside the json first; if none are there, asks
+        for a folder. Names carrying an export suffix (``*_aligned.tif``) are
+        also tried with the suffix stripped, since the matrices refer to the
+        original moving items.
+        """
+        search_dirs = [json_path.parent]
+        found = self._resolve_matrix_files(search_dirs, matrices)
+        if not found:
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select the folder holding those moving items")
+            if not folder:
+                return
+            found = self._resolve_matrix_files([Path(folder)], matrices)
+        if not found:
+            QMessageBox.warning(self, "Progressive Folder",
+                                "Could not find any of those files on disk. "
+                                "Load the moving folder first, then import the matrices.")
+            return
+        self._set_images(found)
+
+    @staticmethod
+    def _resolve_matrix_files(dirs, matrices):
+        """Existing paths for the matrix keys, searched across ``dirs``."""
+        found = []
+        for name in matrices:
+            stem, suffix = Path(name).stem, Path(name).suffix
+            for d in dirs:
+                cand = d / name
+                if cand.is_file():
+                    found.append(str(cand))
+                    break
+                # Try the same stem with any supported extension.
+                hit = next((c for ext in IMAGE_EXTS
+                            if (c := d / f"{stem}{ext}").is_file()), None)
+                if hit is not None:
+                    found.append(str(hit))
+                    break
+                # Try dropping a trailing export suffix ("_aligned").
+                if "_" in stem:
+                    base = stem.rsplit("_", 1)[0]
+                    hit = next((c for ext in ((suffix,) if suffix else ()) + IMAGE_EXTS
+                                if (c := d / f"{base}{ext}").is_file()), None)
+                    if hit is not None:
+                        found.append(str(hit))
+                        break
+        return found
+
+    def _decompose_relative(self, idx, global_matrix):
+        """Relative transform for ``idx`` given its global matrix.
+
+        Inverse of :meth:`_compose_global`: ``rel = inv(global[ref]) @ global``.
+        Returns ``global_matrix`` unchanged in fixed mode, for image 0, or when
+        the reference has no global matrix yet.
+        """
+        global_matrix = np.asarray(global_matrix, dtype=float)
+        ref_idx = self._reference_index(idx)
+        if ref_idx is None:
+            return global_matrix
+        ref_global = self._global_matrix(ref_idx)
+        if ref_global is None:
+            return global_matrix
+        try:
+            return np.linalg.inv(ref_global) @ global_matrix
+        except np.linalg.LinAlgError:
+            return global_matrix
+
     def _save_config(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Progressive Config", "", "JSON Files (*.json)")
         if not path:
@@ -957,7 +1197,7 @@ class ProgressiveFolderPanel(QWidget):
             path += ".json"
         try:
             with open(path, "w") as f:
-                json.dump({"version": 2, "template_path": self.template_path,
+                json.dump({"version": 3, "template_path": self.template_path,
                            "mode": self.mode, "offset": self.offset,
                            "images": self.images, "actions": self.actions}, f, indent=2)
         except Exception as e:
@@ -980,6 +1220,7 @@ class ProgressiveFolderPanel(QWidget):
         self.template_path = data.get("template_path", "")
         self.images = [{
             "path": it.get("path", ""), "n_frames": int(it.get("n_frames", 1)),
+            "is_wavefront": bool(it.get("is_wavefront", int(it.get("n_frames", 1)) > 1)),
             "matrix": it.get("matrix"), "matrix_rel": it.get("matrix_rel", it.get("matrix")),
             "is_anchor": bool(it.get("is_anchor", False)),
             "status": it.get("status", self.STATUS_PENDING), "corr": it.get("corr"),
