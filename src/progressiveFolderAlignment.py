@@ -16,14 +16,24 @@ Workflow
    to the main window for manual alignment.
 3. Align a few items and mark each as an **anchor** (its final matrix is stored).
 4. Build a reusable **action sequence** (set_matrix / auto_keypoints /
-   cross_correlation / reset), like Batch Mode.  Headless ``auto_keypoints``
-   exposes the same constraints as Batch Mode: lock rotation and/or scale (a
-   rigid / similarity fit) plus an optional residual distortion model.
+   cross_correlation / crop / uncrop / reset), like Batch Mode.  Headless
+   ``auto_keypoints`` exposes the same constraints as Batch Mode: lock rotation
+   and/or scale (a rigid / similarity fit) plus an optional residual distortion
+   model.  ``crop`` restricts the *registration* to a centered percentage of
+   both images, so the actions after it ignore the borders (drifting edges,
+   vignetting); the fitted matrix is converted back to full-image coordinates
+   when the crop is released, and the export still writes the full frame.
 5. **Propagate**: for every non-anchor item, set the transform to a prealignment
    matrix interpolated between the two nearest anchors by list index
    (nearest-anchor copy outside the anchor range -- no extrapolation), then
    replay the action sequence on top to refine.
-6. Review per-item status + correlation score, fix outliers, then export aligned
+6. Optionally **smooth** the per-frame curves once every item has a matrix: a
+   centered sliding window (mean / median / Savitzky-Golay) over the display
+   params removes frame-to-frame glitches.  The result is drawn dashed on the 4
+   graphs next to the raw curve and stored separately, so it is a preview until
+   "Use smoothed at export" is ticked -- the raw matrices are never overwritten,
+   and editing any matrix afterwards discards the stale curve.
+7. Review per-item status + correlation score, fix outliers, then export aligned
    items + per-item matrices (``matrices.json``).  Items the wavefront loader can
    read -- multi-frame stacks and single-frame 2-channel files alike -- are
    written back as ImageJ stacks keeping phase + amplitude, as Edit > "Apply
@@ -32,7 +42,10 @@ Workflow
 
 A previously exported ``matrices.json`` can be re-imported ("Load matrices.json")
 to restore per-item transforms as anchors, optionally populating the item list
-from the names it holds.
+from the names it holds.  Items are matched by file name; when the names come
+from a different naming scheme but the item counts agree, the import falls back
+to the number parsed out of each name, then to plain list order, showing the
+proposed pairing for confirmation first.
 
 The prealignment is interpolated on the **center-referenced display params**
 (scale / rotation / tx / ty) produced by
@@ -41,10 +54,12 @@ result is turned back into a matrix by
 :meth:`TransformControls._params_to_affine`.
 """
 import json
+import re
 from pathlib import Path
 
 import numpy as np
 from natsort import natsorted
+from scipy.signal import savgol_filter
 from skimage import transform as tf
 
 from PySide6.QtWidgets import (
@@ -70,6 +85,8 @@ ACTION_TYPES = [
     ("set_matrix", "Set matrix values (scale / rotation / tx / ty)"),
     ("auto_keypoints", "Auto keypoint detection"),
     ("cross_correlation", "Cross-correlation alignment"),
+    ("crop", "Crop to central region (registration only)"),
+    ("uncrop", "Release crop (back to full frame)"),
     ("reset", "Reset transform"),
 ]
 ACTION_LABELS = dict(ACTION_TYPES)
@@ -88,6 +105,14 @@ def _to_2d(img):
     if img.ndim == 3:
         return img[..., 0]
     return img
+
+
+def _translation(ox, oy, invert=False):
+    """3x3 translation matrix; ``invert`` gives the shift *into* crop coords."""
+    s = -1.0 if invert else 1.0
+    return np.array([[1.0, 0.0, s * ox],
+                     [0.0, 1.0, s * oy],
+                     [0.0, 0.0, 1.0]], dtype=float)
 
 
 def representative_frame(path):
@@ -225,6 +250,8 @@ class ProgressiveFolderPanel(QWidget):
         self.template_path = ""
         self.images = []      # list of item dicts
         self.actions = []     # shared action sequence
+        self._crop_state = None   # live registration crop (see _apply_crop)
+        self.smooth_available = False  # a smoothed curve has been computed
         self.current_index = -1
         self.mode = self.MODE_FIXED
         self.offset = 1       # backward offset X for sliding mode
@@ -387,6 +414,19 @@ class ProgressiveFolderPanel(QWidget):
         for s in self.matrix_spins:
             ctrl.addWidget(s)
 
+        # crop options
+        self.crop_pct = QDoubleSpinBox()
+        self.crop_pct.setRange(1.0, 100.0)
+        self.crop_pct.setValue(50.0)
+        self.crop_pct.setSuffix(" %")
+        self.crop_pct.setPrefix("central ")
+        self.crop_pct.setToolTip(
+            "Percentage of each side kept, centered (50% = central half in width "
+            "and height).\nRegistration only: the actions that follow see just "
+            "this region, while the matrix stays in full-image coordinates and "
+            "the export still writes the full frame.")
+        ctrl.addWidget(self.crop_pct)
+
         # auto_keypoints options
         self.ak_use_dialog = QCheckBox("Open dialog")
         self.ak_use_dialog.toggled.connect(self._update_option_visibility)
@@ -422,6 +462,50 @@ class ProgressiveFolderPanel(QWidget):
         edit_row.addStretch()
         v.addLayout(edit_row)
 
+        # --- curve smoothing (optional, post-propagation) ---
+        smooth_row = QHBoxLayout()
+        smooth_row.addWidget(QLabel("Smoothing:"))
+        self.smooth_method = QComboBox()
+        self.smooth_method.addItem("Moving average", "mean")
+        self.smooth_method.addItem("Median", "median")
+        self.smooth_method.addItem("Savitzky-Golay", "savgol")
+        self.smooth_method.setToolTip(
+            "Moving average: plain sliding-window mean, predictable.\n"
+            "Median: rejects a single badly-aligned frame, can produce flat steps.\n"
+            "Savitzky-Golay: follows genuine drift without flattening it.")
+        smooth_row.addWidget(self.smooth_method)
+        smooth_row.addWidget(QLabel("window:"))
+        self.smooth_window = QSpinBox()
+        self.smooth_window.setRange(3, 999)
+        self.smooth_window.setValue(5)
+        self.smooth_window.setSingleStep(2)
+        self.smooth_window.setToolTip(
+            "Number of frames in the sliding window (forced odd so it stays "
+            "centered). Larger = smoother, but real motion is flattened too.")
+        smooth_row.addWidget(self.smooth_window)
+        smooth_btn = QPushButton("Smooth curves")
+        smooth_btn.setToolTip(
+            "Fit a smoothed curve through the per-frame scale / rotation / tx / ty "
+            "once every frame has a matrix.\nDrawn dashed on the 4 graphs for "
+            "comparison; nothing is overwritten and the export keeps using the raw "
+            "matrices until 'Use smoothed' is ticked.")
+        smooth_btn.clicked.connect(self._compute_smoothing)
+        smooth_row.addWidget(smooth_btn)
+        clear_smooth = QPushButton("Clear")
+        clear_smooth.setToolTip("Discard the smoothed curve and go back to the raw matrices.")
+        clear_smooth.clicked.connect(self._clear_smoothing)
+        smooth_row.addWidget(clear_smooth)
+        self.use_smooth = QCheckBox("Use smoothed at export")
+        self.use_smooth.setEnabled(False)
+        self.use_smooth.setToolTip(
+            "When ticked, Export writes the smoothed matrices (and saves them to "
+            "matrices.json) instead of the raw per-frame ones.")
+        # toggled passes a bool; _update_status takes none.
+        self.use_smooth.toggled.connect(lambda _checked: self._update_status())
+        smooth_row.addWidget(self.use_smooth)
+        smooth_row.addStretch()
+        v.addLayout(smooth_row)
+
         # --- propagate + export ---
         run_row = QHBoxLayout()
         run_row.addWidget(QLabel("Low-corr threshold:"))
@@ -450,8 +534,11 @@ class ProgressiveFolderPanel(QWidget):
         save_cfg = QPushButton("Save Config"); save_cfg.clicked.connect(self._save_config)
         load_cfg = QPushButton("Load Config"); load_cfg.clicked.connect(self._load_config)
         load_mat = QPushButton("Load matrices.json")
-        load_mat.setToolTip("Re-import per-item matrices exported by a previous run "
-                            "(matched by file name).")
+        load_mat.setToolTip(
+            "Re-import per-item matrices exported by a previous run.\n"
+            "Matched by file name; when the names differ but the counts agree, "
+            "falls back to the number parsed from the names, then to list order "
+            "(with a confirmation preview).")
         load_mat.clicked.connect(self._load_matrices)
         run_row.addWidget(save_cfg)
         run_row.addWidget(load_cfg)
@@ -469,6 +556,7 @@ class ProgressiveFolderPanel(QWidget):
     def _update_option_visibility(self):
         atype = self.action_combo.currentData()
         self._set_visible(self.matrix_spins, atype == "set_matrix")
+        self.crop_pct.setVisible(atype == "crop")
         is_ak = atype == "auto_keypoints"
         self.ak_use_dialog.setVisible(is_ak)
         headless = is_ak and not self.ak_use_dialog.isChecked()
@@ -517,7 +605,7 @@ class ProgressiveFolderPanel(QWidget):
                 n_frames, is_wf = 1, False
             self.images.append({
                 "path": p, "n_frames": n_frames, "is_wavefront": is_wf,
-                "matrix": None, "matrix_rel": None,
+                "matrix": None, "matrix_rel": None, "matrix_smooth": None,
                 "is_anchor": False, "status": self.STATUS_PENDING, "corr": None,
             })
             progress.setValue(i + 1)
@@ -576,6 +664,9 @@ class ProgressiveFolderPanel(QWidget):
             return
         item = self.images[row]
         self.current_index = row
+        # Selecting an item replaces both aligner images, so any crop state kept
+        # from an earlier run refers to images that are no longer loaded.
+        self._crop_state = None
         if self.aligner.template_image is None:
             self.aligner.load_template_from_path(self.template_path)
         try:
@@ -622,6 +713,8 @@ class ProgressiveFolderPanel(QWidget):
         item["matrix"] = global_m.tolist()
         item["status"] = status
         item["corr"] = self._score_item(item, global_m)
+        # The raw curve moved, so any smoothed curve is now stale.
+        self._invalidate_smoothing()
         return global_m
 
     def _capture_anchor(self):
@@ -647,8 +740,10 @@ class ProgressiveFolderPanel(QWidget):
         item["is_anchor"] = False
         item["matrix"] = None
         item["matrix_rel"] = None
+        item["matrix_smooth"] = None
         item["status"] = self.STATUS_PENDING
         item["corr"] = None
+        self._invalidate_smoothing()
         self._update_row(row)
         self._refresh_plot()
         self._update_status()
@@ -659,6 +754,9 @@ class ProgressiveFolderPanel(QWidget):
         if t == "set_matrix":
             return (f"Set matrix  scale={action.get('scale', 1.0):g}  rot={action.get('rotation', 0.0):g}  "
                     f"tx={action.get('tx', 0.0):g}  ty={action.get('ty', 0.0):g}")
+        if t == "crop":
+            return (f"Crop to central {action.get('pct', 50.0):g}%  "
+                    "(registration only)")
         if t == "auto_keypoints":
             if action.get("dialog", False):
                 return "Auto keypoint detection (dialog)"
@@ -681,6 +779,8 @@ class ProgressiveFolderPanel(QWidget):
             action = {"type": "set_matrix", "scale": self.scale_spin.value(),
                       "rotation": self.rot_spin.value(), "tx": self.tx_spin.value(),
                       "ty": self.ty_spin.value()}
+        elif atype == "crop":
+            action = {"type": "crop", "pct": self.crop_pct.value()}
         elif atype == "auto_keypoints":
             action = {"type": "auto_keypoints", "dialog": self.ak_use_dialog.isChecked()}
             if not action["dialog"]:
@@ -716,6 +816,103 @@ class ProgressiveFolderPanel(QWidget):
         for a in self.actions:
             self.action_list.addItem(self._action_summary(a))
 
+    # ---------------------------------------------------------- crop handling
+    @staticmethod
+    def _crop_box(shape, pct):
+        """Centered crop of ``pct`` percent of each side -> (y0, y1, x0, x1).
+
+        The offset ``(x0, y0)`` is what turns cropped coordinates back into
+        full-image ones. Always keeps at least a 2x2 region.
+        """
+        h, w = shape[:2]
+        frac = max(1.0, min(100.0, float(pct))) / 100.0
+        ch, cw = max(2, int(round(h * frac))), max(2, int(round(w * frac)))
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        return y0, y0 + ch, x0, x0 + cw
+
+    def _apply_crop(self, pct):
+        """Restrict the aligner to the central ``pct`` % of template + moving.
+
+        Registration-only: the images handed to the aligner are cropped, so
+        cross-correlation and keypoint detection see the central region alone,
+        but the crop offsets are remembered so :meth:`_release_crop` can express
+        the resulting matrix back in full-image coordinates. Export is untouched.
+        """
+        a = self.aligner
+        if a.template_image is None or a.moving_image is None:
+            return
+        # Remember the full-frame images so the crop can be released.
+        if self._crop_state is None:
+            self._crop_state = {
+                "template": a.template_image, "template_file": a.template_image_file,
+                "moving": a.moving_image, "moving_file": a.moving_image_file,
+            }
+        full_t = self._crop_state["template"]
+        full_m = self._crop_state["moving"]
+
+        # Take the current transform back to full-image coordinates *before*
+        # the new offsets replace the old ones -- re-cropping while a crop is
+        # already live would otherwise convert from the wrong origin.
+        matrix = None
+        if a.current_transform is not None:
+            matrix = self._to_full_coords(
+                np.asarray(a.current_transform.params, dtype=float))
+
+        ty0, ty1, tx0, tx1 = self._crop_box(full_t.shape, pct)
+        my0, my1, mx0, mx1 = self._crop_box(full_m.shape, pct)
+        self._crop_state["offset_t"] = (float(tx0), float(ty0))
+        self._crop_state["offset_m"] = (float(mx0), float(my0))
+        self._crop_state["pct"] = pct
+
+        a.set_template_array(full_t[ty0:ty1, tx0:tx1],
+                             self._crop_state["template_file"])
+        a.set_moving_array(full_m[my0:my1, mx0:mx1], self._crop_state["moving_file"])
+        if matrix is not None:
+            cropped = self._to_crop_coords(matrix)
+            a.transform_controls.set_values_from_transform(cropped)
+
+    def _release_crop(self):
+        """Undo :meth:`_apply_crop`, converting the matrix back to full coords.
+
+        Safe to call when no crop is active. Returns True when a crop was live.
+        """
+        if self._crop_state is None:
+            return False
+        a = self.aligner
+        state, self._crop_state = self._crop_state, None
+        matrix = None
+        if a.current_transform is not None:
+            matrix = np.asarray(a.current_transform.params, dtype=float)
+        a.set_template_array(state["template"], state["template_file"])
+        a.set_moving_array(state["moving"], state["moving_file"])
+        if matrix is not None:
+            full = self._to_full_coords(matrix, state)
+            a.transform_controls.set_values_from_transform(full)
+        return True
+
+    def _to_crop_coords(self, matrix, state=None):
+        """Full-image matrix -> cropped-image matrix (``T_t @ M @ inv(T_m)``)."""
+        state = state or self._crop_state
+        if state is None or "offset_t" not in state:
+            return np.asarray(matrix, dtype=float)
+        t_t = _translation(*state["offset_t"], invert=True)
+        t_m = _translation(*state["offset_m"], invert=True)
+        return t_t @ np.asarray(matrix, dtype=float) @ np.linalg.inv(t_m)
+
+    def _to_full_coords(self, matrix, state=None):
+        """Cropped-image matrix -> full-image matrix (``inv(T_t) @ M @ T_m``).
+
+        A crop is a pure translation of each image's origin, so a transform
+        fitted on the crops differs from the full-frame one whenever rotation or
+        scale is involved -- this puts the origin back.
+        """
+        state = state or self._crop_state
+        if state is None or "offset_t" not in state:
+            return np.asarray(matrix, dtype=float)
+        t_t = _translation(*state["offset_t"], invert=True)
+        t_m = _translation(*state["offset_m"], invert=True)
+        return np.linalg.inv(t_t) @ np.asarray(matrix, dtype=float) @ t_m
+
     def _execute_action(self, action):
         """Replay one action on the aligner (mirrors batchMode._execute_action)."""
         t = action.get("type")
@@ -739,6 +936,10 @@ class ProgressiveFolderPanel(QWidget):
                     distortion_model=action.get("distortion_model"))
         elif t == "cross_correlation":
             a.optimize_phase_correlation()
+        elif t == "crop":
+            self._apply_crop(action.get("pct", 50.0))
+        elif t == "uncrop":
+            self._release_crop()
         elif t == "reset":
             a.transform_controls.reset_transform()
 
@@ -831,6 +1032,8 @@ class ProgressiveFolderPanel(QWidget):
 
         low = self.low_thresh.value()
         tc = self.aligner.transform_controls
+        # Never start a run with a crop left over from a previous one.
+        self._crop_state = None
         progress = QProgressDialog("Propagating alignment...", "Cancel", 0, len(order), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.show()
@@ -847,6 +1050,7 @@ class ProgressiveFolderPanel(QWidget):
                     global_m = self._compose_global(i, np.array(item["matrix_rel"], dtype=float))
                     item["matrix"] = global_m.tolist()
                     item["corr"] = self._score_item(item, global_m)
+                    self._invalidate_smoothing()
                     self._update_row(i)
                 progress.setValue(n + 1)
                 continue
@@ -871,6 +1075,9 @@ class ProgressiveFolderPanel(QWidget):
             # 2. replay the action sequence to refine on top
             for action in self.actions:
                 self._execute_action(action)
+            # A crop left open by the sequence is registration-only: release it
+            # so the stored matrix is in full-image coordinates.
+            self._release_crop()
             # 3. compose to global, record + score (vs the global template)
             self._store_result(i, self.aligner.current_transform.params, self.STATUS_PROP)
             if (item["corr"] is not None and not np.isnan(item["corr"]) and item["corr"] < low):
@@ -879,6 +1086,8 @@ class ProgressiveFolderPanel(QWidget):
             progress.setValue(n + 1)
 
         progress.close()
+        # A cancel mid-item can leave the aligner holding cropped images.
+        self._release_crop()
         # Restore the fixed template in the main window after sliding propagation.
         if self.mode == self.MODE_SLIDING:
             self.aligner.load_template_from_path(self.template_path)
@@ -940,6 +1149,126 @@ class ProgressiveFolderPanel(QWidget):
                 self.thumb_ax.imshow(rgb)
         self.thumb_canvas.draw_idle()
 
+    # -------------------------------------------------------------- smoothing
+    def _smooth_series(self, ys, window, method, polyorder=2):
+        """Smooth one parameter series with a centered sliding window.
+
+        ``ys`` is dense (one value per frame that has a matrix). Edges use a
+        shrinking window ("nearest"-style) rather than padding, so the first and
+        last frames keep their own value's weight instead of being pulled toward
+        a constant. Returns a list the same length as ``ys``.
+        """
+        arr = np.asarray(ys, dtype=float)
+        n = arr.size
+        if n == 0:
+            return []
+        # An even window has no centre sample; bump it so the result is centred.
+        w = max(1, int(window))
+        if w % 2 == 0:
+            w += 1
+        if w <= 1 or n == 1:
+            return arr.tolist()
+        w = min(w, n if n % 2 else n - 1)  # keep it odd and within the data
+        w = max(w, 1)
+
+        if method == "savgol":
+            po = min(int(polyorder), w - 1)
+            if w <= 1 or po < 1:
+                return arr.tolist()
+            return savgol_filter(arr, w, po, mode="nearest").tolist()
+
+        # Reflect about the endpoints ("odd"/antisymmetric) rather than
+        # shrinking the window: a shrinking window averages [y0, y1, y2] at
+        # index 0 and drags the first and last frames toward the interior,
+        # which is a visible offset on a drifting sequence. Odd reflection
+        # continues the local slope, so a straight ramp smooths to itself.
+        half = w // 2
+        left = 2.0 * arr[0] - arr[1:half + 1][::-1]
+        right = 2.0 * arr[-1] - arr[-half - 1:-1][::-1]
+        padded = np.concatenate([left, arr, right])
+        out = np.empty(n, dtype=float)
+        for i in range(n):
+            seg = padded[i:i + w]
+            out[i] = np.median(seg) if method == "median" else np.mean(seg)
+        return out.tolist()
+
+    def _compute_smoothing(self):
+        """Build the smoothed matrix for every frame that has one.
+
+        Smoothing runs on the **display params** (scale / rotation / tx / ty),
+        the same center-referenced space the prealignment interpolates in, since
+        those vary smoothly frame to frame where raw matrix entries do not.
+        Results are stored per item as ``matrix_smooth``; nothing else is
+        touched, so the raw curve stays available for comparison and the user
+        chooses at export which one to write.
+        """
+        tc = self.aligner.transform_controls
+        idxs = [i for i, it in enumerate(self.images) if it["matrix"] is not None]
+        if len(idxs) < 2:
+            QMessageBox.warning(self, "Progressive Folder",
+                                "Need at least two items with a matrix to smooth.")
+            return False
+
+        series = {k: [] for k in ("scale", "rotation", "tx", "ty")}
+        for i in idxs:
+            p = tc._affine_to_display_params(np.array(self.images[i]["matrix"], dtype=float))
+            for k in series:
+                series[k].append(p[k])
+
+        window = self.smooth_window.value()
+        method = self.smooth_method.currentData()
+        smoothed = {k: self._smooth_series(v, window, method) for k, v in series.items()}
+
+        for pos, i in enumerate(idxs):
+            params = {k: smoothed[k][pos] for k in series}
+            self.images[i]["matrix_smooth"] = tc._params_to_affine(params).tolist()
+        # Frames without a raw matrix cannot have a smoothed one.
+        for i, it in enumerate(self.images):
+            if it["matrix"] is None:
+                it["matrix_smooth"] = None
+
+        self.smooth_available = True
+        self.use_smooth.setEnabled(True)
+        self._refresh_plot()
+        self._update_status()
+        label = self.smooth_method.currentText()
+        self.status_label.setText(
+            f"Smoothed {len(idxs)} matrices ({label}, window {window}). "
+            "Compare the dashed curve, then tick 'Use smoothed' to export it.")
+        return True
+
+    def _invalidate_smoothing(self):
+        """Drop a stale smoothed curve after the raw matrices changed.
+
+        Cheap and redraw-free: ``_store_result`` calls this once per frame during
+        propagation, and its callers already refresh the plot afterwards.
+        """
+        if not self.smooth_available:
+            return
+        for it in self.images:
+            it["matrix_smooth"] = None
+        self.smooth_available = False
+        self.use_smooth.setChecked(False)
+        self.use_smooth.setEnabled(False)
+
+    def _clear_smoothing(self):
+        """Drop the smoothed curve and fall back to the raw matrices."""
+        had = self.smooth_available
+        self._invalidate_smoothing()
+        # Clear unconditionally: a partial curve can outlive the flag.
+        for it in self.images:
+            it["matrix_smooth"] = None
+        self._refresh_plot()
+        self._update_status()
+        if had:
+            self.status_label.setText("Smoothed curve discarded; using raw matrices.")
+
+    def _export_matrix(self, item):
+        """The matrix to export for ``item``: smoothed when the user opted in."""
+        if self.use_smooth.isChecked() and item.get("matrix_smooth") is not None:
+            return np.array(item["matrix_smooth"], dtype=float)
+        return np.array(item["matrix"], dtype=float)
+
     def _refresh_plot(self):
         self.plot_fig.clear()
         if not self.images:
@@ -947,6 +1276,7 @@ class ProgressiveFolderPanel(QWidget):
             return
         tc = self.aligner.transform_controls
         idxs, scales, rots, txs, tys, anchor_idx = [], [], [], [], [], []
+        s_idxs, s_scales, s_rots, s_txs, s_tys = [], [], [], [], []
         for i, item in enumerate(self.images):
             if item["matrix"] is None:
                 continue
@@ -955,16 +1285,29 @@ class ProgressiveFolderPanel(QWidget):
             txs.append(p["tx"]); tys.append(p["ty"])
             if item["is_anchor"]:
                 anchor_idx.append(i)
+            if item.get("matrix_smooth") is not None:
+                sp = tc._affine_to_display_params(
+                    np.array(item["matrix_smooth"], dtype=float))
+                s_idxs.append(i); s_scales.append(sp["scale"]); s_rots.append(sp["rotation"])
+                s_txs.append(sp["tx"]); s_tys.append(sp["ty"])
 
-        specs = [("scale", scales), ("rotation (deg)", rots), ("tx", txs), ("ty", tys)]
-        for k, (title, ys) in enumerate(specs):
+        specs = [("scale", scales, s_scales), ("rotation (deg)", rots, s_rots),
+                 ("tx", txs, s_txs), ("ty", tys, s_tys)]
+        for k, (title, ys, sys_) in enumerate(specs):
             ax = self.plot_fig.add_subplot(2, 2, k + 1)
-            ax.plot(idxs, ys, "-o", markersize=3)
+            ax.plot(idxs, ys, "-o", markersize=3, label="raw")
             for ai in anchor_idx:
                 if ai in idxs:
                     ax.plot(ai, ys[idxs.index(ai)], "s", color="red", markersize=6)
+            if sys_:
+                # Dashed overlay so raw vs smoothed is readable at a glance; the
+                # export follows the "Use smoothed" tick, not what is drawn here.
+                ax.plot(s_idxs, sys_, "--", color="#2E7D32", linewidth=1.6,
+                        label="smoothed")
             ax.set_title(title, fontsize=8)
             ax.tick_params(labelsize=6)
+            if sys_ and k == 0:
+                ax.legend(fontsize=6, loc="best")
         self.plot_fig.tight_layout()
         self.plot_canvas.draw_idle()
 
@@ -1011,7 +1354,7 @@ class ProgressiveFolderPanel(QWidget):
         for n, item in enumerate(items):
             if progress.wasCanceled():
                 break
-            matrix = np.array(item["matrix"], dtype=float)
+            matrix = self._export_matrix(item)
             self.aligner.current_transform = tf.AffineTransform(matrix=matrix)
             matrices[Path(item["path"]).name] = matrix.tolist()
             if self._save_as_stack(item):
@@ -1032,8 +1375,12 @@ class ProgressiveFolderPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write matrices.json: {e}")
             return
-        QMessageBox.information(self, "Progressive Folder",
-                               f"Exported {len(matrices)} item(s) to {out_dir.name}.")
+        kind = ("smoothed" if (self.use_smooth.isChecked() and self.smooth_available)
+                else "raw")
+        QMessageBox.information(
+            self, "Progressive Folder",
+            f"Exported {len(matrices)} item(s) to {out_dir.name} "
+            f"using the {kind} matrices.")
 
     # ------------------------------------------------------------ persistence
     def _load_matrices(self):
@@ -1041,8 +1388,11 @@ class ProgressiveFolderPanel(QWidget):
 
         The file maps ``<file name> -> 3x3 global matrix``. Items are matched by
         file name (the export key), falling back to the stem so a run exported
-        with a ``_aligned`` suffix still matches. Matched items become anchors
-        holding that global matrix, so Propagate can interpolate from them.
+        with a ``_aligned`` suffix still matches, then -- when the counts agree
+        but the names come from another scheme -- to the number parsed out of
+        the names, then to list order (see :meth:`_match_matrices_to_items`).
+        Matched items become anchors holding that global matrix, so Propagate
+        can interpolate from them.
 
         When no item is loaded yet but every key resolves next to the json (or in
         a folder the user picks), the matched files are loaded as the item list.
@@ -1085,22 +1435,20 @@ class ProgressiveFolderPanel(QWidget):
             if not self.images:
                 return
 
-        # name -> matrix, plus a stem-keyed fallback for suffixed exports.
-        by_name = dict(matrices)
-        by_stem = {}
-        for name, arr in matrices.items():
-            by_stem.setdefault(Path(name).stem, arr)
+        pairing, strategy = self._match_matrices_to_items(matrices)
+        if pairing is None:
+            return
 
         n_matched, n_missed = 0, []
         for i, item in enumerate(self.images):
             item_name = Path(item["path"]).name
-            arr = by_name.get(item_name)
-            if arr is None:
-                arr = by_stem.get(Path(item_name).stem)
+            arr = pairing.get(i)
             if arr is None:
                 n_missed.append(item_name)
                 continue
             item["matrix"] = arr.tolist()
+            item["matrix_smooth"] = None
+            self._invalidate_smoothing()
             # Imported matrices are global; the relative transform is only
             # meaningful in sliding mode, so derive it from the reference.
             item["matrix_rel"] = self._decompose_relative(i, arr).tolist()
@@ -1114,11 +1462,144 @@ class ProgressiveFolderPanel(QWidget):
         self._update_status()
         if 0 <= self.current_index < len(self.images):
             self._update_thumbnail(self.current_index)
-        msg = f"Imported {n_matched} matrix/matrices from {Path(path).name}."
+        msg = (f"Imported {n_matched} matrix/matrices from {Path(path).name} "
+               f"({strategy}).")
         if n_missed:
             msg += f"  {len(n_missed)} item(s) unmatched (e.g. {n_missed[0]})."
         self.status_label.setText(msg)
         QMessageBox.information(self, "Progressive Folder", msg)
+
+    # ------------------------------------------------------- matrix matching
+    _NUM_RE = re.compile(r"\d+")
+
+    @classmethod
+    def _name_numbers(cls, name):
+        """Every integer run in a file stem, as ints (``a_03_c12.tif`` -> [3, 12])."""
+        return [int(n) for n in cls._NUM_RE.findall(Path(name).stem)]
+
+    @classmethod
+    def _numeric_index(cls, name, field):
+        """The ``field``-th number of ``name``, or None when it has no such number.
+
+        ``field`` counts from the *end* when negative, so the common
+        ``frame_0012_aligned`` / ``img_12`` pair matches on -1 only if both end
+        with their index; positions are tried by the caller.
+        """
+        nums = cls._name_numbers(name)
+        if not nums:
+            return None
+        try:
+            return nums[field]
+        except IndexError:
+            return None
+
+    def _match_by_number(self, matrices):
+        """Pair items to matrix keys by a number parsed out of their names.
+
+        Tries each number position (first, second, ..., last) on both sides and
+        keeps the first position that yields a *bijection* over all items: every
+        item gets a distinct key. Returns ``{item_index: matrix}`` or None.
+        """
+        item_names = [Path(it["path"]).name for it in self.images]
+        keys = list(matrices)
+        # Candidate positions: leading ones, then trailing ones.
+        positions = [0, -1, 1, -2]
+        for ipos in positions:
+            item_nums = [self._numeric_index(n, ipos) for n in item_names]
+            if any(v is None for v in item_nums) or len(set(item_nums)) != len(item_nums):
+                continue
+            for kpos in positions:
+                key_nums = [self._numeric_index(k, kpos) for k in keys]
+                if any(v is None for v in key_nums):
+                    continue
+                by_num = {}
+                for k, v in zip(keys, key_nums):
+                    by_num.setdefault(v, k)
+                if len(by_num) != len(keys):
+                    continue  # duplicate numbers on the json side
+                if not all(v in by_num for v in item_nums):
+                    continue
+                return {i: matrices[by_num[v]] for i, v in enumerate(item_nums)}, \
+                       {i: by_num[v] for i, v in enumerate(item_nums)}
+        return None
+
+    def _match_matrices_to_items(self, matrices):
+        """Resolve ``{name: matrix}`` against the loaded items.
+
+        Cascade: exact file name -> stem (suffixed exports) -> number parsed
+        from the names -> positional order. The last two only apply when the
+        counts match, and both ask the user to confirm the pairing first.
+
+        Returns ``({item_index: matrix}, strategy_label)``, or ``(None, "")``
+        when the user cancels.
+        """
+        by_name = dict(matrices)
+        by_stem, by_base = {}, {}
+        for name, arr in matrices.items():
+            stem = Path(name).stem
+            by_stem.setdefault(stem, arr)
+            # A key exported with a suffix ("a_aligned") also answers to "a".
+            if "_" in stem:
+                by_base.setdefault(stem.rsplit("_", 1)[0], arr)
+
+        pairing, names = {}, {}
+        for i, item in enumerate(self.images):
+            item_name = Path(item["path"]).name
+            stem = Path(item_name).stem
+            for key, arr in ((item_name, by_name.get(item_name)),
+                             (stem, by_stem.get(stem)),
+                             (stem, by_base.get(stem))):
+                if arr is not None:
+                    pairing[i] = arr
+                    names[i] = key
+                    break
+        if len(pairing) == len(self.images):
+            return pairing, "matched by name"
+        if pairing and len(matrices) != len(self.images):
+            # Partial name match and no equal-count fallback available: keep it.
+            return pairing, "matched by name"
+
+        if len(matrices) != len(self.images):
+            if not pairing:
+                QMessageBox.warning(
+                    self, "Progressive Folder",
+                    f"No item name matches the {len(matrices)} key(s) in that file, "
+                    f"and the counts differ ({len(matrices)} matrices vs "
+                    f"{len(self.images)} items), so they cannot be paired by "
+                    "order either.")
+                return None, ""
+            return pairing, "matched by name"
+
+        # Equal counts: try numbers parsed from the names, then plain order.
+        numeric = self._match_by_number(matrices)
+        if numeric is not None:
+            cand_pairing, cand_names = numeric
+            label = "matched by number in the name"
+        else:
+            keys = natsorted(matrices)
+            cand_pairing = {i: matrices[k] for i, k in enumerate(keys)}
+            cand_names = {i: k for i, k in enumerate(keys)}
+            label = "matched by order"
+
+        if not self._confirm_pairing(cand_names, label):
+            return None, ""
+        return cand_pairing, label
+
+    def _confirm_pairing(self, names, label):
+        """Preview a fallback pairing (json key -> item) and ask to apply it."""
+        preview = []
+        for i in list(names)[:8]:
+            preview.append(f"  {names[i]}  ->  {Path(self.images[i]['path']).name}")
+        more = len(names) - len(preview)
+        if more > 0:
+            preview.append(f"  ... and {more} more")
+        text = (f"The file names do not match, but both sides hold "
+                f"{len(self.images)} item(s).\n\nProposed pairing ({label}):\n\n"
+                + "\n".join(preview) + "\n\nApply it?")
+        return QMessageBox.question(
+            self, "Load matrices.json", text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
 
     def _adopt_matrix_files(self, json_path, matrices):
         """Populate the item list from the names in a matrices.json.
@@ -1222,9 +1703,15 @@ class ProgressiveFolderPanel(QWidget):
             "path": it.get("path", ""), "n_frames": int(it.get("n_frames", 1)),
             "is_wavefront": bool(it.get("is_wavefront", int(it.get("n_frames", 1)) > 1)),
             "matrix": it.get("matrix"), "matrix_rel": it.get("matrix_rel", it.get("matrix")),
+            "matrix_smooth": it.get("matrix_smooth"),
             "is_anchor": bool(it.get("is_anchor", False)),
             "status": it.get("status", self.STATUS_PENDING), "corr": it.get("corr"),
         } for it in images]
+        # A config saved after smoothing brings its curve back with it.
+        self.smooth_available = any(it["matrix_smooth"] is not None for it in self.images)
+        self.use_smooth.setEnabled(self.smooth_available)
+        if not self.smooth_available:
+            self.use_smooth.setChecked(False)
         self.actions = list(data.get("actions", []))
         # Restore reference mode + offset (v1 configs default to fixed).
         self.offset = int(data.get("offset", 1))
@@ -1250,9 +1737,14 @@ class ProgressiveFolderPanel(QWidget):
         n_aligned = sum(1 for it in self.images if it["matrix"] is not None)
         n_low = sum(1 for it in self.images if it["status"] == self.STATUS_LOW)
         cur = f"  ·  current: {self.current_index + 1}/{n}" if self.current_index >= 0 else ""
+        if self.smooth_available:
+            smooth = ("  ·  smoothed: EXPORTING" if self.use_smooth.isChecked()
+                      else "  ·  smoothed: preview only")
+        else:
+            smooth = ""
         self.status_label.setText(
             f"{n} item(s)  ·  {n_anchor} anchor(s)  ·  {n_aligned} aligned  ·  "
-            f"{n_low} low-corr  ·  {len(self.actions)} action(s){cur}")
+            f"{n_low} low-corr  ·  {len(self.actions)} action(s){smooth}{cur}")
 
 
 # --------------------------------------------------------------- tiny helpers

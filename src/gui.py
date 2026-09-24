@@ -16,7 +16,7 @@ from imageCanva import ImageCanvas
 from transformControls import TransformControls
 from keyPointsSelection import KeyPointsSelection, estimate_transform_keypoints, estimate_constrained_transform
 from keyPointsDetectionAndSelection import KeyPointsDetectionAndSelection, detect_keypoint_pairs
-from utils_images import load_imgfile, load_wavefront_tif, save_stack
+from utils_images import load_imgfile, load_wavefront_tif, read_stack_info, save_stack
 from optics import (
     estimate_scale_translation, estimate_distortion,
     field_from_phase_amp, phase_amp_from_field, propagate_asm,
@@ -1802,7 +1802,9 @@ class ImageAligner(QMainWindow):
         stack = np.stack(frames, axis=0)  # (N, H, W, 2)
 
         try:
-            save_stack(out_path, stack, source_path=in_path)
+            metas = read_stack_info(in_path)
+            metas["registration"] = self._registration_metadata(output_shape)
+            save_stack(out_path, stack, source_path=in_path, metas=metas)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save stack: {e}")
             return
@@ -1810,6 +1812,28 @@ class ImageAligner(QMainWindow):
         self.statusBar().showMessage(
             f"Exported transformed stack ({n_frames} frames) to: {Path(out_path).name}"
         )
+
+    def _registration_metadata(self, output_shape=None):
+        """Describe the current registration for the exported stack's metadata.
+
+        ``transform_matrix`` is the 3x3 ``current_transform`` mapping **moving**
+        pixel coords to **template** pixel coords (``template ~= M @ moving``,
+        homogeneous ``[x, y, 1]``), as written by "Save transformation matrix".
+        """
+        meta = {
+            "transform_matrix": (
+                self.current_transform.params.tolist()
+                if self.current_transform is not None else np.eye(3).tolist()
+            ),
+            "transform_convention": "moving->template, [x, y, 1] pixel coords",
+            "distortion_applied": self.distortion_transform is not None,
+        }
+        if output_shape is not None:
+            meta["output_shape"] = [int(v) for v in output_shape]
+        tpl_file = getattr(self, "template_image_file", None)
+        if isinstance(tpl_file, (str, Path)):
+            meta["template_path"] = str(tpl_file)
+        return meta
 
     def export_propagated_stack_to_folder(self, in_path, folder, suffix, optics,
                                           z_tpl_um=0.0, z_mov_um=0.0,
@@ -1864,16 +1888,19 @@ class ImageAligner(QMainWindow):
         if mov_stack is None:
             return
         mov_out = str(out_dir / f"{Path(in_path).stem}{suffix}.tif")
-        save_stack(mov_out, mov_stack, source_path=in_path,
-                   metas={"optics": optics, "z_mov_um": z_mov_um, "z_tpl_um": z_tpl_um})
+        mov_metas = read_stack_info(in_path)
+        mov_metas.update({"optics": optics, "z_mov_um": z_mov_um, "z_tpl_um": z_tpl_um,
+                          "registration": self._registration_metadata(out_shape)})
+        save_stack(mov_out, mov_stack, source_path=in_path, metas=mov_metas)
         saved = [Path(mov_out).name]
 
         if save_template and template_path:
             tpl_stack = _save_one(template_path, z_tpl_um, px_tpl, warp=False)
             if tpl_stack is not None:
                 tpl_out = str(out_dir / f"{Path(template_path).stem}{suffix}_template.tif")
-                save_stack(tpl_out, tpl_stack, source_path=template_path,
-                           metas={"optics": optics, "z_tpl_um": z_tpl_um})
+                tpl_metas = read_stack_info(template_path)
+                tpl_metas.update({"optics": optics, "z_tpl_um": z_tpl_um})
+                save_stack(tpl_out, tpl_stack, source_path=template_path, metas=tpl_metas)
                 saved.append(Path(tpl_out).name)
 
         self.statusBar().showMessage(f"Exported propagated stack(s): {', '.join(saved)}")

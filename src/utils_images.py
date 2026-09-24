@@ -137,6 +137,27 @@ def load_wavefront_tif(path: str, frame_index: int = 0):
     return phase.astype(np.float32), amp.astype(np.float32), n_frames
 
 
+def read_stack_info(path: str) -> Dict[str, object]:
+    """Return the ImageJ ``Info`` metadata of the TIFF at ``path`` as a dict.
+
+    :func:`save_stack` (and the reconstruction pipeline) store acquisition
+    metadata as JSON in the ImageJ ``Info`` tag. Non-JSON Info text is kept
+    under ``"source_info"``; files without Info yield an empty dict.
+    """
+    try:
+        with tifffile.TiffFile(path) as tif:
+            info = (tif.imagej_metadata or {}).get("Info")
+    except Exception:
+        return {}
+    if not info:
+        return {}
+    try:
+        parsed = json.loads(info)
+    except (TypeError, ValueError):
+        return {"source_info": str(info)}
+    return parsed if isinstance(parsed, dict) else {"source_info": parsed}
+
+
 def save_stack(path: str,
                stack: np.ndarray,
                wavelengths: Optional[Tuple[float, ...]] = None,
